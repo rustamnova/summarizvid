@@ -23,9 +23,28 @@ logs/
 | Переменная | Описание |
 |---|---|
 | `BOT_TOKEN` | Токен Telegram-бота (от @BotFather) |
+| `XAI_API_KEY` / `GROK_API` | API-ключ xAI (Grok) |
+| `XAI_MODEL` | Модель Grok, например `grok-4-latest` |
+| `OPENAI_API_KEY` | API-ключ OpenAI для финальной редактуры текста |
+| `OPENAI_MODEL` | Модель OpenAI, например `gpt-4o-mini` |
+| `TRANSCRIPT_LANGS` | Предпочтительные языки субтитров через запятую (`ru,en`) |
+| `MAX_COMMENTS` | Макс. комментариев для анализа (по умолчанию `80`) |
 | `GITHUB_TOKEN` | GitHub Personal Access Token |
 | `USER_IDS` | Разрешённые Telegram user ID через запятую |
 | `REPO_URL` | URL репозитория нового бота |
+
+Пример:
+
+```env
+BOT_TOKEN=...
+XAI_API_KEY=...
+XAI_MODEL=grok-4-latest
+OPENAI_API_KEY=...
+OPENAI_MODEL=gpt-4o-mini
+TRANSCRIPT_LANGS=ru,en
+MAX_COMMENTS=80
+USER_IDS=123456789
+```
 
 ## Установка
 
@@ -43,6 +62,22 @@ bash stop.sh       # Остановка
 bash restart.sh    # Перезапуск
 screen -r BOTNAME  # Подключиться к сессии
 ```
+
+## Использование бота
+
+```text
+/sum https://www.youtube.com/watch?v=VIDEO_ID
+/sum https://www.tiktok.com/@user/video/VIDEO_ID
+```
+
+Также можно просто отправить ссылку YouTube/TikTok сообщением.
+
+Бот вернет:
+- читабельный суммариз видео (без таймкодов);
+- отдельный блок по комментариям:
+  - основная мысль комментариев;
+  - важные комментарии;
+  - популярные комментарии.
 
 ## Логи
 
