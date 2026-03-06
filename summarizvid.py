@@ -7,6 +7,8 @@ import uuid
 import asyncio
 import logging
 import logging.handlers
+import subprocess
+import tempfile
 from urllib.parse import urlparse, parse_qs
 
 import httpx
@@ -471,6 +473,113 @@ async def request_openai_comments_summary(video_url: str, platform: str, comment
     return content.strip()
 
 
+def extract_audio_ffmpeg(video_path: str, audio_path: str) -> None:
+    """Extract audio from video file, compress to mono mp3 64kbps."""
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "mp3", "-ac", "1", "-ab", "64k", audio_path],
+        capture_output=True,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        raise SummaryError(f"ffmpeg error: {result.stderr.decode()[:500]}")
+
+
+async def transcribe_with_whisper(audio_path: str) -> str:
+    """Transcribe audio file via OpenAI Whisper API. Returns plain text."""
+    if not OPENAI_API_KEY:
+        raise SummaryError("OPENAI_API_KEY не задан — транскрипция через Whisper недоступна")
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+    async with httpx.AsyncClient(timeout=300) as client:
+        resp = await client.post(
+            f"{OPENAI_BASE_URL}/audio/transcriptions",
+            headers=headers,
+            files={"file": (os.path.basename(audio_path), audio_bytes, "audio/mpeg")},
+            data={"model": "whisper-1", "response_format": "text"},
+        )
+        resp.raise_for_status()
+        return resp.text.strip()
+
+
+async def summarize_video_file_and_reply(update: Update, file_id: str, file_name: str, file_size: int):
+    trace_id = uuid.uuid4().hex[:8]
+    user_id = update.effective_user.id
+
+    MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # Telegram bot API limit
+    if file_size > MAX_DOWNLOAD_BYTES:
+        await update.message.reply_text(
+            f"⚠️ Файл слишком большой ({file_size // 1024 // 1024} МБ).\n"
+            "Telegram позволяет боту скачивать файлы до 20 МБ. Сожми видео или обрежь до нужного фрагмента."
+        )
+        return
+
+    log.info("videofile.start trace=%s user=%s size=%s name=%s", trace_id, user_id, file_size, file_name)
+    status_msg = await update.message.reply_text("⏳ Скачиваю видео...")
+
+    tmpdir = tempfile.mkdtemp(prefix="summvid_")
+    video_path = os.path.join(tmpdir, "video.mp4")
+    audio_path = os.path.join(tmpdir, "audio.mp3")
+
+    try:
+        # 1. Download from Telegram
+        file_obj = await update.effective_message.get_bot().get_file(file_id)
+        await file_obj.download_to_drive(video_path)
+        log.info("videofile.downloaded trace=%s bytes=%s", trace_id, os.path.getsize(video_path))
+
+        # 2. Extract audio via ffmpeg
+        await status_msg.edit_text("🔊 Извлекаю аудиодорожку...")
+        await asyncio.to_thread(extract_audio_ffmpeg, video_path, audio_path)
+        audio_size = os.path.getsize(audio_path)
+        log.info("videofile.audio trace=%s audio_bytes=%s", trace_id, audio_size)
+
+        if audio_size > 25 * 1024 * 1024:
+            raise SummaryError("Аудиодорожка слишком длинная даже после сжатия (>25 МБ для Whisper). Обрежь видео.")
+
+        # 3. Transcribe via Whisper
+        await status_msg.edit_text("🎙 Распознаю речь (Whisper)...")
+        transcript = await transcribe_with_whisper(audio_path)
+        if not transcript:
+            raise SummaryError("Whisper не распознал речь — возможно, видео без голоса или слишком тихое")
+        log.info("videofile.transcript trace=%s chars=%s preview=%s", trace_id, len(transcript), transcript[:80])
+
+        # 4. Summarize via Grok
+        await status_msg.edit_text("🤖 Анализирую содержимое...")
+        title = file_name or "Видеофайл"
+        raw_summary = await request_grok_summary("file", title, title, transcript[:MAX_TRANSCRIPT_CHARS])
+        log.info("videofile.grok.ok trace=%s", trace_id)
+
+        # 5. Rewrite via OpenAI
+        final_summary = await request_openai_rewrite(title, "file", raw_summary)
+        log.info("videofile.openai.ok trace=%s", trace_id)
+
+        await status_msg.delete()
+
+    except SummaryError as e:
+        log.error("videofile.fail trace=%s reason=%s", trace_id, e)
+        await status_msg.edit_text(f"❌ {e}\nКод: {trace_id}")
+        return
+    except Exception:
+        log.exception("videofile.fail trace=%s unexpected", trace_id)
+        await status_msg.edit_text(f"❌ Неожиданная ошибка при обработке файла. Код: {trace_id}")
+        return
+    finally:
+        for p in (video_path, audio_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+        try:
+            os.rmdir(tmpdir)
+        except Exception:
+            pass
+
+    chunk_size = 3900
+    for i in range(0, len(final_summary), chunk_size):
+        await update.message.reply_text(final_summary[i : i + chunk_size])
+    log.info("videofile.done trace=%s chunks=%s", trace_id, (len(final_summary) + chunk_size - 1) // chunk_size)
+
+
 def get_url_from_text(text: str) -> str | None:
     match = re.search(r"(https?://\S+)", text or "")
     return match.group(1).strip() if match else None
@@ -536,9 +645,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     log.info("/start от %s", update.effective_user.id)
     await update.message.reply_text(
-        "Привет! Я суммаризатор YouTube/TikTok.\n"
-        "Команда: /sum <video_url>\n"
-        "Пример: /sum https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        "Привет! Я суммаризатор видео.\n\n"
+        "Что умею:\n"
+        "• YouTube / TikTok ссылка — суммариз + анализ комментариев\n"
+        "• Видеофайл (до 20 МБ) — транскрипция через Whisper + суммариз\n\n"
+        "Команды:\n"
+        "/sum <url> — суммаризировать видео по ссылке\n\n"
+        "Или просто пришли ссылку / видеофайл 🎥"
     )
 
 
@@ -569,6 +682,23 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await summarize_video_and_reply(update, url)
 
 
+async def on_video_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update.effective_user.id):
+        return
+    msg = update.message
+    if msg.video:
+        file_id = msg.video.file_id
+        file_size = msg.video.file_size or 0
+        file_name = getattr(msg.video, "file_name", None) or "video.mp4"
+    elif msg.document and (msg.document.mime_type or "").startswith("video/"):
+        file_id = msg.document.file_id
+        file_size = msg.document.file_size or 0
+        file_name = msg.document.file_name or "video.mp4"
+    else:
+        return
+    await summarize_video_file_and_reply(update, file_id, file_name, file_size)
+
+
 def main():
     log.info("=== Запуск бота ===")
     app = Application.builder().token(BOT_TOKEN).build()
@@ -576,6 +706,8 @@ def main():
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("sum", cmd_sum))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_text))
+    app.add_handler(MessageHandler(filters.VIDEO, on_video_file))
+    app.add_handler(MessageHandler(filters.Document.VIDEO, on_video_file))
     log.info("Бот запущен, ожидание обновлений...")
     app.run_polling(drop_pending_updates=True)
     log.info("=== Остановка бота ===")
