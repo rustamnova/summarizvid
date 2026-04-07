@@ -47,8 +47,8 @@ MAX_COMMENT_CHARS = int(os.getenv("MAX_COMMENT_CHARS", "16000"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing in .env")
-if not XAI_API_KEY:
-    raise RuntimeError("XAI_API_KEY (or GROK_API) is missing in .env")
+if not XAI_API_KEY and not OPENAI_API_KEY:
+    raise RuntimeError("Необходим хотя бы один ключ: XAI_API_KEY (или GROK_API) или OPENAI_API_KEY")
 
 # ---------------------------
 # Logging
@@ -312,7 +312,12 @@ def build_video_summary_prompt(platform: str, video_url: str, title: str, conten
     )
 
 
+_GROK_RETRYABLE_STATUSES = {429, 502, 503}
+
+
 async def request_grok_summary(platform: str, video_url: str, title: str, content_text: str) -> str:
+    if not XAI_API_KEY:
+        raise SummaryError("XAI_API_KEY не задан")
     payload = {
         "model": XAI_MODEL,
         "temperature": 0.2,
@@ -323,27 +328,87 @@ async def request_grok_summary(platform: str, video_url: str, title: str, conten
         ],
     }
     headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
+    last_err: Exception | None = None
+    for attempt in range(3):
+        if attempt > 0:
+            await asyncio.sleep(3 * attempt)
+        try:
+            async with httpx.AsyncClient(timeout=90) as client:
+                resp = await client.post(f"{XAI_BASE_URL}/chat/completions", headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else 0
+            body = e.response.text[:900] if e.response is not None else ""
+            if status in _GROK_RETRYABLE_STATUSES and attempt < 2:
+                log.warning("Grok API HTTP %s, retry %s/3 body=%s", status, attempt + 1, body[:200])
+                last_err = e
+                continue
+            log.error("Grok API HTTP error: status=%s body=%s", status, body)
+            raise SummaryError(f"Grok API вернул HTTP {status}") from e
+        except httpx.HTTPError as e:
+            log.error("Grok API network error: %s", e)
+            raise SummaryError("Сетевой сбой при запросе к Grok API") from e
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+            log.error("Grok API parse error: %s", e)
+            raise SummaryError("Некорректный ответ от Grok API") from e
+        else:
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not content:
+                log.error("Grok API empty content: %s", str(data)[:1000])
+                raise SummaryError("Grok API вернул пустой ответ")
+            return content.strip()
+
+    raise SummaryError("Grok API временно недоступен после 3 попыток") from last_err
+
+
+async def request_openai_summary(platform: str, video_url: str, title: str, content_text: str) -> str:
+    if not OPENAI_API_KEY:
+        raise SummaryError("OpenAI API недоступен — OPENAI_API_KEY не задан")
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.2,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "messages": [
+            {"role": "system", "content": "Ты точный ассистент по суммаризации видео."},
+            {"role": "user", "content": build_video_summary_prompt(platform, video_url, title, content_text)},
+        ],
+    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=90) as client:
-            resp = await client.post(f"{XAI_BASE_URL}/chat/completions", headers=headers, json=payload)
+            resp = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
     except httpx.HTTPStatusError as e:
         body = e.response.text[:900] if e.response is not None else ""
-        log.error("Grok API HTTP error: status=%s body=%s", e.response.status_code if e.response else "n/a", body)
-        raise SummaryError(f"Grok API вернул HTTP {e.response.status_code}") from e
+        log.error("OpenAI summary HTTP error: status=%s body=%s", e.response.status_code if e.response else "n/a", body)
+        raise SummaryError(f"OpenAI API вернул HTTP {e.response.status_code}") from e
     except httpx.HTTPError as e:
-        log.error("Grok API network error: %s", e)
-        raise SummaryError("Сетевой сбой при запросе к Grok API") from e
+        log.error("OpenAI summary network error: %s", e)
+        raise SummaryError("Сетевой сбой при запросе к OpenAI API") from e
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
-        log.error("Grok API parse error: %s", e)
-        raise SummaryError("Некорректный ответ от Grok API") from e
+        log.error("OpenAI summary parse error: %s", e)
+        raise SummaryError("Некорректный ответ от OpenAI API") from e
 
     content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
     if not content:
-        log.error("Grok API empty content: %s", str(data)[:1000])
-        raise SummaryError("Grok API вернул пустой ответ")
+        log.error("OpenAI summary empty content: %s", str(data)[:1000])
+        raise SummaryError("OpenAI API вернул пустой ответ")
     return content.strip()
+
+
+async def request_summary_with_fallback(platform: str, video_url: str, title: str, content_text: str) -> str:
+    """Пробует Grok, при ошибке — фоллбэк на OpenAI."""
+    if XAI_API_KEY:
+        try:
+            return await request_grok_summary(platform, video_url, title, content_text)
+        except SummaryError as e:
+            if OPENAI_API_KEY:
+                log.warning("Grok недоступен (%s), переключаюсь на OpenAI", e)
+            else:
+                raise
+    return await request_openai_summary(platform, video_url, title, content_text)
 
 
 async def request_openai_rewrite(video_url: str, platform: str, draft_summary: str) -> str:
@@ -543,11 +608,11 @@ async def summarize_video_file_and_reply(update: Update, file_id: str, file_name
             raise SummaryError("Whisper не распознал речь — возможно, видео без голоса или слишком тихое")
         log.info("videofile.transcript trace=%s chars=%s preview=%s", trace_id, len(transcript), transcript[:80])
 
-        # 4. Summarize via Grok
+        # 4. Summarize via Grok (or OpenAI fallback)
         await status_msg.edit_text("🤖 Анализирую содержимое...")
         title = file_name or "Видеофайл"
-        raw_summary = await request_grok_summary("file", title, title, transcript[:MAX_TRANSCRIPT_CHARS])
-        log.info("videofile.grok.ok trace=%s", trace_id)
+        raw_summary = await request_summary_with_fallback("file", title, title, transcript[:MAX_TRANSCRIPT_CHARS])
+        log.info("videofile.summary.ok trace=%s", trace_id)
 
         # 5. Rewrite via OpenAI
         final_summary = await request_openai_rewrite(title, "file", raw_summary)
@@ -605,9 +670,9 @@ async def summarize_video_and_reply(update: Update, url: str):
         content_text = await asyncio.to_thread(build_content_text, platform, url, info)
         log.info("sum.content.ok trace=%s chars=%s", trace_id, len(content_text))
 
-        log.info("sum.grok.request trace=%s", trace_id)
-        raw_summary = await request_grok_summary(platform, url, title, content_text)
-        log.info("sum.grok.ok trace=%s chars=%s", trace_id, len(raw_summary))
+        log.info("sum.summary.request trace=%s", trace_id)
+        raw_summary = await request_summary_with_fallback(platform, url, title, content_text)
+        log.info("sum.summary.ok trace=%s chars=%s", trace_id, len(raw_summary))
 
         log.info("sum.openai.video.request trace=%s model=%s", trace_id, OPENAI_MODEL)
         final_video_summary = await request_openai_rewrite(url, platform, raw_summary)
