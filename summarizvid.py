@@ -11,6 +11,9 @@ import subprocess
 import tempfile
 from urllib.parse import urlparse, parse_qs
 
+sys.path.insert(0, "/root/.bots/shared")
+from bot_logging import setup_bot_logging
+
 import httpx
 import yt_dlp
 from dotenv import load_dotenv
@@ -53,31 +56,7 @@ if not XAI_API_KEY and not OPENAI_API_KEY:
 # ---------------------------
 # Logging
 # ---------------------------
-_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-
-_worklog_handler = logging.handlers.RotatingFileHandler(
-    os.path.join(LOG_DIR, "worklog.txt"), maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
-)
-_worklog_handler.setLevel(logging.INFO)
-_worklog_handler.setFormatter(_fmt)
-
-_error_handler = logging.handlers.RotatingFileHandler(
-    os.path.join(LOG_DIR, "errors.txt"), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-)
-_error_handler.setLevel(logging.ERROR)
-_error_handler.setFormatter(_fmt)
-
-_console_handler = logging.StreamHandler(sys.stdout)
-_console_handler.setLevel(logging.INFO)
-_console_handler.setFormatter(_fmt)
-
-logging.root.handlers.clear()
-logging.root.setLevel(logging.INFO)
-logging.root.addHandler(_worklog_handler)
-logging.root.addHandler(_error_handler)
-logging.root.addHandler(_console_handler)
-
-log = logging.getLogger(__name__)
+log, _log_install_unused = setup_bot_logging(__name__, __file__)
 
 
 class SummaryError(Exception):
