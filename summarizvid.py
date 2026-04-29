@@ -11,7 +11,6 @@ import subprocess
 import tempfile
 from urllib.parse import urlparse, parse_qs
 
-sys.path.insert(0, "/root/.bots/shared")
 from bot_logging import setup_bot_logging
 
 import httpx
@@ -56,7 +55,7 @@ if not XAI_API_KEY and not OPENAI_API_KEY:
 # ---------------------------
 # Logging
 # ---------------------------
-log, _log_install_unused = setup_bot_logging(__name__, __file__)
+log = setup_bot_logging(__name__, __file__)
 
 
 class SummaryError(Exception):

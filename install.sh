@@ -1,129 +1,114 @@
 #!/bin/bash
+# summarizvid — one-command installer
+# Usage: bash install.sh
 
-WORKDIR="/root/.bots"
-mkdir -p "$WORKDIR"
+set -euo pipefail
 
-# === Шаг 1: Получение .env ===
-echo "📥 Вставьте .env файл (BOT_TOKEN, GITHUB_TOKEN, REPO_URL, ...), затем нажмите Ctrl+D:"
-ENV_TEMP=$(mktemp)
-cat > "$ENV_TEMP"
-source "$ENV_TEMP"
-
-# === Проверка переменных ===
-if [[ -z "$GITHUB_TOKEN" || -z "$BOT_TOKEN" || -z "$REPO_URL" ]]; then
-  echo "❌ Не заданы GITHUB_TOKEN, BOT_TOKEN или REPO_URL"
-  exit 1
-fi
-
-# === Шаг 2: Клонирование репозитория ===
-REPO=$(echo "$REPO_URL" | sed -E 's|https://github.com/||;s|\.git$||')
-BOT_NAME=$(basename "$REPO")
+REPO_URL="https://github.com/rustamnova/summarizvid"
+BOT_NAME="summarizvid"
+WORKDIR="${BOTS_DIR:-/root/.bots}"
 BOT_DIR="$WORKDIR/$BOT_NAME"
 
-echo "🌐 Клонируем репозиторий $REPO_URL → $BOT_DIR"
-rm -rf "$BOT_DIR"
-git clone https://$GITHUB_TOKEN@github.com/$REPO.git "$BOT_DIR" || {
-  echo "❌ Ошибка клонирования"
+echo "============================================"
+echo "  summarizvid installer"
+echo "============================================"
+
+# === Step 1: .env ===
+echo ""
+echo "📋 Paste your .env content (copy from .env.example and fill in), then press Ctrl+D:"
+ENV_TEMP=$(mktemp)
+cat > "$ENV_TEMP"
+
+source "$ENV_TEMP" 2>/dev/null || true
+if [[ -z "${BOT_TOKEN:-}" ]]; then
+  echo "❌ BOT_TOKEN is required in .env"
+  rm -f "$ENV_TEMP"
   exit 1
-}
-
-# === Инициализация директории логов ===
-mkdir -p "$BOT_DIR/logs"
-INSTALL_LOG="$BOT_DIR/logs/install.txt"
-touch "$INSTALL_LOG"
-
-# Все дальнейшие echo пишутся и в консоль, и в install.txt
-exec > >(tee -a "$INSTALL_LOG") 2>&1
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🚀 Установка бота $BOT_NAME начата"
-
-# === Копирование .env ===
-cp "$ENV_TEMP" "$BOT_DIR/.env"
-rm "$ENV_TEMP"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ .env скопирован"
-
-# === Переход в директорию и проверка основного .py файла ===
-cd "$BOT_DIR" || exit 1
-if [ ! -f "$BOT_NAME.py" ]; then
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ Не найден файл $BOT_NAME.py"
+fi
+if [[ -z "${XAI_API_KEY:-}" && -z "${OPENAI_API_KEY:-}" ]]; then
+  echo "❌ At least one of XAI_API_KEY or OPENAI_API_KEY is required"
+  rm -f "$ENV_TEMP"
   exit 1
 fi
 
-# === Установка системных пакетов ===
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 📦 Установка системных зависимостей..."
-apt update -qq
-apt install -y python3.12 python3.12-venv python3.12-dev git screen ffmpeg build-essential
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ Системные пакеты установлены"
+# === Step 2: Clone ===
+mkdir -p "$WORKDIR"
+echo ""
+echo "📥 Cloning $REPO_URL → $BOT_DIR"
+rm -rf "$BOT_DIR"
+git clone "$REPO_URL.git" "$BOT_DIR"
 
-# === Виртуальное окружение ===
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🐍 Настройка Python-окружения..."
-python3.12 -m venv venv
+mkdir -p "$BOT_DIR/logs"
+INSTALL_LOG="$BOT_DIR/logs/install.txt"
+exec > >(tee -a "$INSTALL_LOG") 2>&1
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🚀 Installing $BOT_NAME..."
+
+cp "$ENV_TEMP" "$BOT_DIR/.env"
+rm -f "$ENV_TEMP"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ .env written"
+
+# === Step 3: System packages ===
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 📦 Installing system packages..."
+apt-get update -qq
+apt-get install -y python3 python3-venv python3-dev git screen ffmpeg build-essential
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ System packages installed"
+
+# === Step 4: Python venv ===
+cd "$BOT_DIR"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🐍 Setting up Python venv..."
+python3 -m venv venv
 source venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt || true
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ Python-окружение готово"
+pip install --upgrade pip -q
+pip install -r requirements.txt -q
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ Python venv ready"
 
-# === Генерация скриптов ===
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚙️ Генерация скриптов..."
-
+# === Step 5: Scripts ===
 cat > start.sh << 'STARTEOF'
 #!/bin/bash
 cd "$(dirname "$0")"
-BOT_NAME=$(basename "$(pwd)")
 source venv/bin/activate
 mkdir -p logs
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] ▶️ Запуск $BOT_NAME..." >> logs/worklog.txt
-python $BOT_NAME.py 2>> logs/errors.txt
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⏹ $BOT_NAME остановлен (exit $?)" >> logs/worklog.txt
+python summarizvid.py
 STARTEOF
 
 cat > stop.sh << 'STOPEOF'
 #!/bin/bash
 cd "$(dirname "$0")"
-BOT_NAME=$(basename "$(pwd)")
-SESSION_NAME="$BOT_NAME"
-if screen -list | grep -q "\.${SESSION_NAME}"; then
-  echo "🛑 Остановка screen-сессии $SESSION_NAME..."
-  screen -S "$SESSION_NAME" -X quit
-  echo "✅ $BOT_NAME остановлен."
+SESSION="summarizvid"
+if screen -list | grep -q "\.$SESSION"; then
+  screen -S "$SESSION" -X quit && echo "✅ Stopped"
 else
-  echo "⚠️ screen-сессия $SESSION_NAME не найдена."
+  echo "⚠️  Screen session not found"
 fi
 STOPEOF
 
 cat > restart.sh << 'RESTARTEOF'
 #!/bin/bash
 cd "$(dirname "$0")"
-BOT_NAME=$(basename "$(pwd)")
-SESSION_NAME="$BOT_NAME"
-if screen -list | grep -q "\.${SESSION_NAME}"; then
-  echo "🛑 Остановка screen-сессии $SESSION_NAME..."
-  screen -S "$SESSION_NAME" -X quit
-fi
-echo "🔄 Перезапуск $BOT_NAME..."
-screen -dmS "$SESSION_NAME" ./start.sh
-echo "✅ $BOT_NAME перезапущен в screen: $SESSION_NAME"
+SESSION="summarizvid"
+screen -S "$SESSION" -X quit 2>/dev/null || true
+sleep 1
+screen -dmS "$SESSION" ./start.sh
+echo "✅ Restarted in screen: $SESSION"
 RESTARTEOF
 
 chmod +x start.sh stop.sh restart.sh
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ Скрипты созданы"
 
-# === Завершение старых screen-сессий ===
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🧹 Завершаем старые screen-сессии: $BOT_NAME"
-screen -ls | grep "\.${BOT_NAME}" | awk '{print $1}' | while read -r session_id; do
-  screen -S "$session_id" -X quit
-done
+# === Step 6: Launch ===
+screen -S summarizvid -X quit 2>/dev/null || true
+screen -dmS summarizvid "$BOT_DIR/start.sh"
 
-# === Запуск новой screen-сессии ===
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 📺 Запуск новой screen-сессии..."
-screen -dmS "$BOT_NAME" "$BOT_DIR/start.sh"
-
-sleep 1
-if screen -list | grep -q "\.${BOT_NAME}"; then
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ Бот $BOT_NAME запущен в screen-сессии"
+sleep 2
+if screen -list | grep -q "\.summarizvid"; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ Bot launched in screen session 'summarizvid'"
 else
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ Ошибка запуска screen-сессии"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ Launch failed — check logs/errors.txt"
 fi
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🏁 Установка завершена. Логи: $BOT_DIR/logs/"
-echo "ℹ️  Подключиться: screen -r $BOT_NAME"
+echo ""
+echo "============================================"
+echo "  Installation complete!"
+echo "  Attach: screen -r summarizvid"
+echo "  Logs:   $BOT_DIR/logs/"
+echo "============================================"

@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 *.pyo
 .env
-logs/*.txt
-logs/*.log
-logs/*.gz
+logs/
+graphify-out/
+.idea/
+*.db
+*.sqlite3

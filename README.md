@@ -1,97 +1,112 @@
-# Bot Template
+# summarizvid — Telegram Video Summarizer Bot
 
-Шаблон Telegram-бота. Используется как основа для быстрого создания новых ботов.
+A Telegram bot that summarizes YouTube and TikTok videos using AI (Grok / OpenAI). Send a link — get a clean, readable summary of the video and its top comments.
 
-## Структура
+## Features
 
-```
-bot-template.py   # Основной файл бота (переименовать по имени нового бота)
-install.sh        # Установка с нуля
-start.sh          # Запуск
-stop.sh           # Остановка
-restart.sh        # Перезапуск
-requirements.txt  # Python-зависимости
-.env              # Переменные окружения (заполнить перед установкой)
-logs/
-├── worklog.txt   # Рабочий лог (INFO+)
-├── errors.txt    # Ошибки (ERROR+)
-└── install.txt   # Лог установки
-```
+- **YouTube & TikTok** — paste a link or use `/sum <url>`
+- **Smart transcript extraction** — prefers native subtitles; falls back to Whisper transcription for videos without them
+- **Video file support** — send an `.mp4` / `.mov` file directly to the bot
+- **Comment analysis** — summarizes top comments alongside the video
+- **Grok + OpenAI** — uses xAI Grok as primary model, OpenAI as automatic fallback
+- **Access control** — optionally restrict to specific Telegram user IDs
 
-## Переменные окружения (`.env`)
+## Quick Start
 
-| Переменная | Описание |
-|---|---|
-| `BOT_TOKEN` | Токен Telegram-бота (от @BotFather) |
-| `XAI_API_KEY` / `GROK_API` | API-ключ xAI (Grok) |
-| `XAI_MODEL` | Модель Grok, например `grok-4-latest` |
-| `OPENAI_API_KEY` | API-ключ OpenAI для финальной редактуры текста |
-| `OPENAI_MODEL` | Модель OpenAI, например `gpt-4o-mini` |
-| `TRANSCRIPT_LANGS` | Предпочтительные языки субтитров через запятую (`ru,en`) |
-| `MAX_COMMENTS` | Макс. комментариев для анализа (по умолчанию `80`) |
-| `GITHUB_TOKEN` | GitHub Personal Access Token |
-| `USER_IDS` | Разрешённые Telegram user ID через запятую |
-| `REPO_URL` | URL репозитория нового бота |
+### Requirements
 
-Пример:
+- Linux server with Python 3.10+
+- `ffmpeg` (for audio extraction)
+- Telegram bot token (from [@BotFather](https://t.me/BotFather))
+- At least one AI API key: [xAI (Grok)](https://console.x.ai/) and/or [OpenAI](https://platform.openai.com/)
 
-```env
-BOT_TOKEN=...
-XAI_API_KEY=...
-XAI_MODEL=grok-4-latest
-OPENAI_API_KEY=...
-OPENAI_MODEL=gpt-4o-mini
-TRANSCRIPT_LANGS=ru,en
-MAX_COMMENTS=80
-USER_IDS=123456789
-```
-
-## Установка
+### Install
 
 ```bash
+bash <(curl -s https://raw.githubusercontent.com/rustamnova/summarizvid/main/install.sh)
+```
+
+Or clone and run manually:
+
+```bash
+git clone https://github.com/rustamnova/summarizvid.git
+cd summarizvid
 bash install.sh
 ```
 
-Скрипт запросит содержимое `.env`, клонирует репозиторий, установит зависимости и запустит бота.
+The installer will prompt you to paste your `.env`, install dependencies, and launch the bot in a `screen` session.
 
-## Управление
+### Manual setup (without installer)
 
 ```bash
-bash start.sh      # Запуск
-bash stop.sh       # Остановка
-bash restart.sh    # Перезапуск
-screen -r BOTNAME  # Подключиться к сессии
+git clone https://github.com/rustamnova/summarizvid.git
+cd summarizvid
+
+cp .env.example .env
+# Edit .env — fill in BOT_TOKEN and at least one AI key
+
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+python summarizvid.py
 ```
 
-## Использование бота
+## Configuration
 
-```text
+Copy `.env.example` to `.env` and fill in your values:
+
+| Variable | Required | Description |
+|---|---|---|
+| `BOT_TOKEN` | ✅ | Telegram bot token from @BotFather |
+| `XAI_API_KEY` | one of two | xAI (Grok) API key — primary model |
+| `XAI_MODEL` | — | Grok model (default: `grok-3-mini`) |
+| `OPENAI_API_KEY` | one of two | OpenAI API key — fallback model |
+| `OPENAI_MODEL` | — | OpenAI model (default: `gpt-4o-mini`) |
+| `USER_IDS` | — | Comma-separated Telegram IDs allowed to use the bot. Leave empty to allow anyone. |
+| `TRANSCRIPT_LANGS` | — | Preferred subtitle languages, e.g. `ru,en` (default: `ru,en`) |
+| `SUMMARY_LANG` | — | Language of the output summary (default: `ru`) |
+| `MAX_COMMENTS` | — | Max comments to analyze (default: `80`) |
+
+## Usage
+
+```
 /sum https://www.youtube.com/watch?v=VIDEO_ID
 /sum https://www.tiktok.com/@user/video/VIDEO_ID
 ```
 
-Также можно просто отправить ссылку YouTube/TikTok сообщением.
+You can also just send the URL as a plain message. For videos without subtitles, the bot will download audio and transcribe it via OpenAI Whisper — this takes 30–60 seconds depending on video length.
 
-Бот вернет:
-- читабельный суммариз видео (без таймкодов);
-- отдельный блок по комментариям:
-  - основная мысль комментариев;
-  - важные комментарии;
-  - популярные комментарии.
+## Managing the bot
 
-## Логи
+```bash
+bash start.sh      # Start
+bash stop.sh       # Stop
+bash restart.sh    # Restart
+screen -r summarizvid   # Attach to the running session
+```
 
-| Файл | Что пишется |
+Logs are written to `logs/`:
+
+| File | Contents |
 |---|---|
-| `logs/worklog.txt` | Запуск, остановка, вся рабочая активность (INFO+) |
-| `logs/errors.txt` | Только ошибки (ERROR+) |
-| `logs/install.txt` | Лог установки (только при установке) |
+| `logs/worklog.txt` | All activity (INFO+) |
+| `logs/errors.txt` | Errors only (ERROR+) |
+| `logs/install.txt` | Install log |
 
-## Создание нового бота на основе шаблона
+## Project structure
 
-1. Создать новый репозиторий на GitHub
-2. Скопировать содержимое шаблона
-3. Переименовать `bot-template.py` → `<botname>.py`
-4. Заполнить `.env`
-5. Написать логику бота в `.py` файле
-6. Запушить и запустить `bash install.sh`
+```
+summarizvid.py    # Main bot
+bot_logging.py    # Logging setup
+install.sh        # One-command installer
+start.sh          # Start script
+stop.sh           # Stop script
+restart.sh        # Restart script
+requirements.txt  # Python dependencies
+.env.example      # Config template
+```
+
+## License
+
+MIT
