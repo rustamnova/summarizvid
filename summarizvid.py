@@ -8,6 +8,9 @@ import asyncio
 import logging
 import logging.handlers
 import subprocess
+import base64
+import glob
+import shutil
 import tempfile
 from urllib.parse import urlparse, parse_qs
 
@@ -516,6 +519,16 @@ async def request_openai_comments_summary(video_url: str, platform: str, comment
     return content.strip()
 
 
+def has_audio_stream(video_path: str) -> bool:
+    """Return True if video has at least one audio stream."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+         "stream=codec_type", "-of", "csv=p=0", video_path],
+        capture_output=True, timeout=30,
+    )
+    return bool(probe.stdout.strip())
+
+
 def extract_audio_ffmpeg(video_path: str, audio_path: str) -> None:
     """Extract audio from video file, compress to mono mp3 64kbps."""
     result = subprocess.run(
@@ -524,7 +537,58 @@ def extract_audio_ffmpeg(video_path: str, audio_path: str) -> None:
         timeout=180,
     )
     if result.returncode != 0:
-        raise SummaryError(f"ffmpeg error: {result.stderr.decode()[:500]}")
+        err = result.stderr.decode(errors="replace")
+        raise SummaryError(f"ffmpeg error: {err[-400:]}")
+
+
+def extract_frames_ffmpeg(video_path: str, frames_dir: str, n_frames: int = 6) -> list:
+    """Extract n_frames evenly-spaced JPEG frames. Returns sorted list of paths."""
+    dur_probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", video_path],
+        capture_output=True, timeout=30,
+    )
+    duration = float(dur_probe.stdout.strip() or "10")
+    interval = max(duration / n_frames, 0.5)
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path, "-vf", f"fps=1/{interval:.2f}",
+         "-vframes", str(n_frames), "-q:v", "5",
+         os.path.join(frames_dir, "frame_%03d.jpg")],
+        capture_output=True, timeout=120,
+    )
+    return sorted(glob.glob(os.path.join(frames_dir, "frame_*.jpg")))
+
+
+async def describe_frames_with_gpt(frame_paths: list) -> str:
+    """Send frames to GPT-4o-mini Vision and return description of video content."""
+    if not OPENAI_API_KEY:
+        raise SummaryError("OPENAI_API_KEY не задан — визуальный анализ недоступен")
+    content = [{
+        "type": "text",
+        "text": (
+            "Перед тобой кадры из короткого видео по порядку. "
+            "Опиши подробно: что происходит, кто или что изображено, "
+            "какой текст виден на экране, какова тема и суть видео. "
+            "Пиши на русском."
+        )
+    }]
+    for path in frame_paths:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"}
+        })
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 1000,
+    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
 
 
 async def transcribe_with_whisper(audio_path: str) -> str:
@@ -570,21 +634,49 @@ async def summarize_video_file_and_reply(update: Update, file_id: str, file_name
         await file_obj.download_to_drive(video_path)
         log.info("videofile.downloaded trace=%s bytes=%s", trace_id, os.path.getsize(video_path))
 
-        # 2. Extract audio via ffmpeg
-        await status_msg.edit_text("🔊 Извлекаю аудиодорожку...")
-        await asyncio.to_thread(extract_audio_ffmpeg, video_path, audio_path)
-        audio_size = os.path.getsize(audio_path)
-        log.info("videofile.audio trace=%s audio_bytes=%s", trace_id, audio_size)
+        # 2. Extract frames + audio in parallel (frames always, audio only if stream exists)
+        frames_dir = os.path.join(tmpdir, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        video_has_audio = await asyncio.to_thread(has_audio_stream, video_path)
 
-        if audio_size > 25 * 1024 * 1024:
-            raise SummaryError("Аудиодорожка слишком длинная даже после сжатия (>25 МБ для Whisper). Обрежь видео.")
+        if video_has_audio:
+            await status_msg.edit_text("🔊 Извлекаю аудио и кадры...")
+            await asyncio.gather(
+                asyncio.to_thread(extract_audio_ffmpeg, video_path, audio_path),
+                asyncio.to_thread(extract_frames_ffmpeg, video_path, frames_dir),
+            )
+            audio_size = os.path.getsize(audio_path)
+            log.info("videofile.audio trace=%s audio_bytes=%s", trace_id, audio_size)
+            if audio_size > 25 * 1024 * 1024:
+                raise SummaryError("Аудиодорожка слишком длинная даже после сжатия (>25 МБ для Whisper). Обрежь видео.")
+            frame_paths = sorted(glob.glob(os.path.join(frames_dir, "frame_*.jpg")))
+            await status_msg.edit_text("🎙 Распознаю речь и анализирую кадры...")
+            tasks = [transcribe_with_whisper(audio_path)]
+            if frame_paths:
+                tasks.append(describe_frames_with_gpt(frame_paths))
+            results = await asyncio.gather(*tasks)
+            transcript_audio = results[0]
+            transcript_visual = results[1] if len(results) > 1 else ""
+            log.info("videofile.audio_transcript trace=%s chars=%s", trace_id, len(transcript_audio))
+            if transcript_visual:
+                log.info("videofile.visual_transcript trace=%s chars=%s", trace_id, len(transcript_visual))
+            parts = []
+            if transcript_audio:
+                parts.append("[АУДИОДОРОЖКА]:\n" + transcript_audio)
+            if transcript_visual:
+                parts.append("[ВИЗУАЛЬНЫЙ РЯД]:\n" + transcript_visual)
+            transcript = ("\n\n").join(parts)
+            if not transcript:
+                raise SummaryError("Whisper не распознал речь и кадры не извлечены")
+        else:
+            await status_msg.edit_text("🖼 Аудио нет — анализирую видеоряд по кадрам...")
+            frame_paths = await asyncio.to_thread(extract_frames_ffmpeg, video_path, frames_dir)
+            if not frame_paths:
+                raise SummaryError("Не удалось извлечь кадры из видео")
+            log.info("videofile.frames trace=%s count=%s", trace_id, len(frame_paths))
+            transcript = await describe_frames_with_gpt(frame_paths)
 
-        # 3. Transcribe via Whisper
-        await status_msg.edit_text("🎙 Распознаю речь (Whisper)...")
-        transcript = await transcribe_with_whisper(audio_path)
-        if not transcript:
-            raise SummaryError("Whisper не распознал речь — возможно, видео без голоса или слишком тихое")
-        log.info("videofile.transcript trace=%s chars=%s preview=%s", trace_id, len(transcript), transcript[:80])
+        log.info("videofile.transcript trace=%s total_chars=%s", trace_id, len(transcript))
 
         # 4. Summarize via Grok (or OpenAI fallback)
         await status_msg.edit_text("🤖 Анализирую содержимое...")
@@ -607,13 +699,8 @@ async def summarize_video_file_and_reply(update: Update, file_id: str, file_name
         await status_msg.edit_text(f"❌ Неожиданная ошибка при обработке файла. Код: {trace_id}")
         return
     finally:
-        for p in (video_path, audio_path):
-            try:
-                os.unlink(p)
-            except Exception:
-                pass
         try:
-            os.rmdir(tmpdir)
+            shutil.rmtree(tmpdir, ignore_errors=True)
         except Exception:
             pass
 
