@@ -43,6 +43,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
+# MTProto (Telethon) — для скачивания файлов больше 20 МБ (лимит Bot API).
+# Через MTProto бот тем же токеном может качать до 2 ГБ.
+TELETHON_API_ID = int(os.getenv("TELETHON_API_ID", "0"))
+TELETHON_API_HASH = os.getenv("TELETHON_API_HASH", "").strip()
+MTPROTO_SESSION = os.path.join(BASE_DIR, "summarizvid_mtproto")
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "2000"))  # жёсткий потолок Telegram — 2 ГБ
+
 SUMMARY_LANG = os.getenv("SUMMARY_LANG", "ru").strip()
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "900"))
 TRANSCRIPT_LANGS = [x.strip() for x in os.getenv("TRANSCRIPT_LANGS", "ru,en").split(",") if x.strip()]
@@ -609,29 +616,75 @@ async def transcribe_with_whisper(audio_path: str) -> str:
         return resp.text.strip()
 
 
+# === MTProto-клиент для больших файлов (лениво, один на процесс) ===
+_mtproto_client = None
+_mtproto_lock = asyncio.Lock()
+
+
+async def _get_mtproto_client():
+    """Возвращает запущенный Telethon-клиент, авторизованный токеном бота."""
+    global _mtproto_client
+    async with _mtproto_lock:
+        if _mtproto_client is None or not _mtproto_client.is_connected():
+            from telethon import TelegramClient
+            client = TelegramClient(MTPROTO_SESSION, TELETHON_API_ID, TELETHON_API_HASH)
+            await client.start(bot_token=BOT_TOKEN)
+            _mtproto_client = client
+    return _mtproto_client
+
+
+async def download_via_mtproto(file_id: str, dest_path: str):
+    """Скачивает файл по Bot API file_id через MTProto (обход лимита Bot API 20 МБ).
+
+    Качаем именно по file_id, а не через get_messages: у свежей бот-сессии
+    MTProto нет access_hash чата, и поиск сообщения по chat_id упал бы
+    с ошибкой «Could not find the input entity».
+    """
+    client = await _get_mtproto_client()
+    result_path = await client.download_media(file_id, file=dest_path)
+    if not result_path or not os.path.exists(dest_path):
+        raise SummaryError("Не удалось скачать файл через MTProto")
+
+
 async def summarize_video_file_and_reply(update: Update, file_id: str, file_name: str, file_size: int):
     trace_id = uuid.uuid4().hex[:8]
     user_id = update.effective_user.id
 
-    MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # Telegram bot API limit
-    if file_size > MAX_DOWNLOAD_BYTES:
+    BOT_API_LIMIT = 20 * 1024 * 1024   # лимит скачивания через Bot API
+    size_mb = file_size // 1024 // 1024
+
+    if file_size > MAX_FILE_MB * 1024 * 1024:
         await update.message.reply_text(
-            f"⚠️ Файл слишком большой ({file_size // 1024 // 1024} МБ).\n"
-            "Telegram позволяет боту скачивать файлы до 20 МБ. Сожми видео или обрежь до нужного фрагмента."
+            f"⚠️ Файл слишком большой ({size_mb} МБ). Максимум — {MAX_FILE_MB} МБ."
         )
         return
 
-    log.info("videofile.start trace=%s user=%s size=%s name=%s", trace_id, user_id, file_size, file_name)
-    status_msg = await update.message.reply_text("⏳ Скачиваю видео...")
+    use_mtproto = file_size > BOT_API_LIMIT
+    if use_mtproto and not (TELETHON_API_ID and TELETHON_API_HASH):
+        await update.message.reply_text(
+            f"⚠️ Файл слишком большой ({size_mb} МБ).\n"
+            "MTProto-скачивание не настроено (нет TELETHON_API_ID/HASH в .env) — "
+            "пока лимит 20 МБ. Сожми видео или обрежь до нужного фрагмента."
+        )
+        return
+
+    log.info("videofile.start trace=%s user=%s size=%s name=%s mtproto=%s",
+             trace_id, user_id, file_size, file_name, use_mtproto)
+    status_msg = await update.message.reply_text(
+        f"⏳ Скачиваю видео ({size_mb} МБ)..." if use_mtproto else "⏳ Скачиваю видео..."
+    )
 
     tmpdir = tempfile.mkdtemp(prefix="summvid_")
     video_path = os.path.join(tmpdir, "video.mp4")
     audio_path = os.path.join(tmpdir, "audio.mp3")
 
     try:
-        # 1. Download from Telegram
-        file_obj = await update.effective_message.get_bot().get_file(file_id)
-        await file_obj.download_to_drive(video_path)
+        # 1. Download from Telegram: до 20 МБ — Bot API, больше — MTProto (до 2 ГБ)
+        if use_mtproto:
+            await download_via_mtproto(file_id, video_path)
+        else:
+            file_obj = await update.effective_message.get_bot().get_file(file_id)
+            await file_obj.download_to_drive(video_path)
         log.info("videofile.downloaded trace=%s bytes=%s", trace_id, os.path.getsize(video_path))
 
         # 2. Extract frames + audio in parallel (frames always, audio only if stream exists)
@@ -778,7 +831,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Привет! Я суммаризатор видео.\n\n"
         "Что умею:\n"
         "• YouTube / TikTok ссылка — суммариз + анализ комментариев\n"
-        "• Видеофайл (до 20 МБ) — транскрипция через Whisper + суммариз\n\n"
+        "• Видеофайл (до 2 ГБ) — транскрипция через Whisper + суммариз\n\n"
         "Команды:\n"
         "/sum <url> — суммаризировать видео по ссылке\n\n"
         "Или просто пришли ссылку / видеофайл 🎥"

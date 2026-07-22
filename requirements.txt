@@ -3,3 +3,4 @@ python-dotenv
 httpx
 youtube-transcript-api
 yt-dlp
+telethon
