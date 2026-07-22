@@ -633,17 +633,45 @@ async def _get_mtproto_client():
     return _mtproto_client
 
 
-async def download_via_mtproto(file_id: str, dest_path: str):
-    """Скачивает файл по Bot API file_id через MTProto (обход лимита Bot API 20 МБ).
+async def download_via_mtproto(file_id: str, chat_id: int, message_id: int, dest_path: str):
+    """Скачивает файл через MTProto (обход лимита Bot API 20 МБ).
 
-    Качаем именно по file_id, а не через get_messages: у свежей бот-сессии
-    MTProto нет access_hash чата, и поиск сообщения по chat_id упал бы
-    с ошибкой «Could not find the input entity».
+    Два пути:
+    1. По Bot API file_id — работает не всегда: Telethon не умеет парсить
+       новые версии формата file_id и молча возвращает None.
+    2. Через get_messages по chat_id/message_id. Требует access_hash чата
+       в кэше сессии — он появляется, когда клиент ловит апдейт о самом
+       сообщении, поэтому клиент держится подключённым постоянно, а здесь
+       стоят ретраи на случай гонки с доставкой апдейта.
     """
     client = await _get_mtproto_client()
-    result_path = await client.download_media(file_id, file=dest_path)
-    if not result_path or not os.path.exists(dest_path):
-        raise SummaryError("Не удалось скачать файл через MTProto")
+
+    try:
+        result_path = await client.download_media(file_id, file=dest_path)
+        if result_path and os.path.exists(dest_path):
+            return
+        log.warning("mtproto: download по file_id вернул пусто, пробую get_messages")
+    except Exception:
+        log.warning("mtproto: download по file_id упал, пробую get_messages", exc_info=True)
+
+    last_err: Exception | None = None
+    for _ in range(6):
+        try:
+            msg = await client.get_messages(chat_id, ids=message_id)
+            if msg is not None and msg.media is not None:
+                result_path = await client.download_media(msg, file=dest_path)
+                if result_path and os.path.exists(dest_path):
+                    return
+                raise SummaryError("MTProto: файл не сохранился на диск")
+            last_err = SummaryError("MTProto: сообщение без медиа или не найдено")
+        except SummaryError:
+            raise
+        except Exception as e:  # ValueError «Could not find the input entity» и сетевые
+            last_err = e
+        await asyncio.sleep(1.5)
+
+    log.error("mtproto: все попытки исчерпаны: %s", last_err)
+    raise SummaryError("Не удалось скачать файл через MTProto")
 
 
 async def summarize_video_file_and_reply(update: Update, file_id: str, file_name: str, file_size: int):
@@ -681,7 +709,9 @@ async def summarize_video_file_and_reply(update: Update, file_id: str, file_name
     try:
         # 1. Download from Telegram: до 20 МБ — Bot API, больше — MTProto (до 2 ГБ)
         if use_mtproto:
-            await download_via_mtproto(file_id, video_path)
+            await download_via_mtproto(
+                file_id, update.effective_chat.id, update.effective_message.message_id, video_path
+            )
         else:
             file_obj = await update.effective_message.get_bot().get_file(file_id)
             await file_obj.download_to_drive(video_path)
@@ -882,9 +912,21 @@ async def on_video_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await summarize_video_file_and_reply(update, file_id, file_name, file_size)
 
 
+async def _post_init(app):
+    """Поднимает MTProto-клиент сразу при старте: подключённый клиент получает
+    те же апдейты и кэширует access_hash чатов — без этого get_messages для
+    больших файлов падал бы на первом же сообщении."""
+    if TELETHON_API_ID and TELETHON_API_HASH:
+        try:
+            await _get_mtproto_client()
+            log.info("MTProto-клиент запущен (большие файлы до %s МБ)", MAX_FILE_MB)
+        except Exception:
+            log.exception("Не удалось запустить MTProto-клиент — большие файлы будут недоступны")
+
+
 def main():
     log.info("=== Запуск бота ===")
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("sum", cmd_sum))
