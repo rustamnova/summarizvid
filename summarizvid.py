@@ -38,10 +38,24 @@ USER_IDS = set(int(x.strip()) for x in os.getenv("USER_IDS", "").split(",") if x
 XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip() or os.getenv("GROK_API", "").strip()
 XAI_BASE_URL = os.getenv("XAI_BASE_URL", "https://api.x.ai/v1").strip().rstrip("/")
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4-latest").strip()
+# Grok выключен по умолчанию: аккаунт исчерпал кредиты и отдаёт 403 на каждый
+# запрос, из-за чего каждое видео впустую ждало таймаут перед фоллбэком.
+# Вернуть в строй: USE_GROK=1 в .env после пополнения баланса xAI.
+USE_GROK = os.getenv("USE_GROK", "0").strip().lower() in {"1", "true", "yes"}
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+
+# Модели под конкретные задачи: дешёвая OPENAI_MODEL осталась только на
+# второстепенных вещах (разбор комментариев), а тяжёлую работу — распознавание
+# текста на кадрах и финальный пересказ — делают сильные модели.
+SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "gpt-5.5").strip()
+VISION_MODEL = os.getenv("VISION_MODEL", "gpt-5.4").strip()
+# Diarize размечает реплики по говорящим — это то, что превращает «поток слов»
+# в читаемый диалог. При сбое откатываемся на обычные модели транскрипции.
+TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-4o-transcribe-diarize").strip()
+TRANSCRIBE_FALLBACKS = ["gpt-4o-transcribe", "whisper-1"]
 
 # MTProto (Telethon) — для скачивания файлов больше 20 МБ (лимит Bot API).
 # Через MTProto бот тем же токеном может качать до 2 ГБ.
@@ -51,7 +65,22 @@ MTPROTO_SESSION = os.path.join(BASE_DIR, "summarizvid_mtproto")
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "2000"))  # жёсткий потолок Telegram — 2 ГБ
 
 SUMMARY_LANG = os.getenv("SUMMARY_LANG", "ru").strip()
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "900"))
+# Финальный пересказ намеренно длиннее прежних 900 токенов (MAX_OUTPUT_TOKENS):
+# в старый лимит подробный разговор не помещался и модель выбрасывала как раз
+# содержание реплик.
+SUMMARY_MAX_TOKENS = int(os.getenv("SUMMARY_MAX_TOKENS", "6000"))
+
+# Кадры для распознавания текста и описания картинки.
+VISION_MAX_FRAMES = int(os.getenv("VISION_MAX_FRAMES", "32"))
+VISION_FRAME_EVERY_SEC = float(os.getenv("VISION_FRAME_EVERY_SEC", "4"))
+# detail=high обязателен: при low кадр ужимается до 512x512 и мелкие титры,
+# субтитры и надписи становятся физически нечитаемыми.
+VISION_DETAIL = os.getenv("VISION_DETAIL", "high").strip()
+
+# Лимит /audio/transcriptions — 25 МБ на файл, поэтому длинное аудио режем на
+# куски по времени и склеиваем результат.
+AUDIO_CHUNK_SEC = int(os.getenv("AUDIO_CHUNK_SEC", "900"))
+WHISPER_SIZE_LIMIT = 24 * 1024 * 1024
 TRANSCRIPT_LANGS = [x.strip() for x in os.getenv("TRANSCRIPT_LANGS", "ru,en").split(",") if x.strip()]
 MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "120000"))
 MAX_COMMENTS = int(os.getenv("MAX_COMMENTS", "80"))
@@ -281,38 +310,82 @@ def extract_comments(info: dict) -> list[dict]:
     return comments
 
 
-def build_video_summary_prompt(platform: str, video_url: str, title: str, content_text: str) -> str:
-    return (
-        f"Сделай черновой конспект видео.\n"
-        f"Платформа: {platform}\n"
-        f"Язык ответа: {SUMMARY_LANG}\n"
-        f"Ссылка: {video_url}\n"
-        f"Заголовок: {title}\n\n"
-        "Верни обычный текст в 3 секциях:\n"
-        "1) Краткая суть (1 абзац)\n"
-        "2) Основные идеи (5-8 пунктов)\n"
-        "3) Практические выводы (3-5 пунктов)\n\n"
-        "Требования:\n"
-        "- Не выдумывай факты.\n"
-        "- Не пиши таймкоды.\n"
-        "- Если данных мало, укажи это явно.\n\n"
-        f"Материал:\n{content_text}"
-    )
+def _uses_completion_tokens(model: str) -> bool:
+    """True для моделей, которые не принимают max_tokens (семейства gpt-5 и o-*)."""
+    m = model.lower()
+    return m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4")
+
+
+async def openai_chat(
+    messages: list,
+    model: str,
+    max_tokens: int,
+    temperature: float | None = 0.2,
+    timeout: float = 180,
+    what: str = "OpenAI",
+) -> str:
+    """Единая точка вызова OpenAI chat/completions с разбором ошибок.
+
+    Сам подставляет max_completion_tokens вместо max_tokens там, где этого
+    требует модель (gpt-5.x / o-серия отвергают max_tokens с HTTP 400).
+    """
+    if not OPENAI_API_KEY:
+        raise SummaryError("OPENAI_API_KEY не задан")
+
+    payload: dict = {"model": model, "messages": messages}
+    if _uses_completion_tokens(model):
+        payload["max_completion_tokens"] = max_tokens
+    else:
+        payload["max_tokens"] = max_tokens
+    if temperature is not None:
+        payload["temperature"] = temperature
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
+            # Часть моделей (например gpt-5.5) принимает только temperature=1 и
+            # отвечает 400. Поддержка отличается даже внутри одного семейства,
+            # поэтому не угадываем по имени, а повторяем запрос без параметра.
+            if resp.status_code == 400 and "temperature" in resp.text and "temperature" in payload:
+                log.info("%s: модель %s не принимает temperature, повторяю без неё", what, model)
+                payload.pop("temperature")
+                resp = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code if e.response is not None else 0
+        body = e.response.text[:900] if e.response is not None else ""
+        log.error("%s HTTP error: status=%s body=%s", what, status, body)
+        raise SummaryError(f"{what}: API вернул HTTP {status}") from e
+    except httpx.HTTPError as e:
+        log.error("%s network error: %s", what, e)
+        raise SummaryError(f"{what}: сетевой сбой") from e
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+        log.error("%s parse error: %s", what, e)
+        raise SummaryError(f"{what}: некорректный ответ API") from e
+
+    content = (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+    if not content:
+        log.error("%s empty content: %s", what, str(data)[:1000])
+        raise SummaryError(f"{what}: API вернул пустой ответ")
+    return content.strip()
 
 
 _GROK_RETRYABLE_STATUSES = {429, 502, 503}
 
 
-async def request_grok_summary(platform: str, video_url: str, title: str, content_text: str) -> str:
+async def request_grok_chat(system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+    """Запрос к Grok с готовыми промптами. Живёт только при USE_GROK=1."""
     if not XAI_API_KEY:
         raise SummaryError("XAI_API_KEY не задан")
     payload = {
         "model": XAI_MODEL,
         "temperature": 0.2,
-        "max_tokens": MAX_OUTPUT_TOKENS,
+        "max_tokens": max_tokens,
         "messages": [
-            {"role": "system", "content": "Ты точный ассистент по суммаризации видео."},
-            {"role": "user", "content": build_video_summary_prompt(platform, video_url, title, content_text)},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
     }
     headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
@@ -350,107 +423,95 @@ async def request_grok_summary(platform: str, video_url: str, title: str, conten
     raise SummaryError("Grok API временно недоступен после 3 попыток") from last_err
 
 
-async def request_openai_summary(platform: str, video_url: str, title: str, content_text: str) -> str:
-    if not OPENAI_API_KEY:
-        raise SummaryError("OpenAI API недоступен — OPENAI_API_KEY не задан")
-    payload = {
-        "model": OPENAI_MODEL,
-        "temperature": 0.2,
-        "max_tokens": MAX_OUTPUT_TOKENS,
-        "messages": [
-            {"role": "system", "content": "Ты точный ассистент по суммаризации видео."},
-            {"role": "user", "content": build_video_summary_prompt(platform, video_url, title, content_text)},
-        ],
-    }
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    try:
-        async with httpx.AsyncClient(timeout=90) as client:
-            resp = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPStatusError as e:
-        body = e.response.text[:900] if e.response is not None else ""
-        log.error("OpenAI summary HTTP error: status=%s body=%s", e.response.status_code if e.response else "n/a", body)
-        raise SummaryError(f"OpenAI API вернул HTTP {e.response.status_code}") from e
-    except httpx.HTTPError as e:
-        log.error("OpenAI summary network error: %s", e)
-        raise SummaryError("Сетевой сбой при запросе к OpenAI API") from e
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
-        log.error("OpenAI summary parse error: %s", e)
-        raise SummaryError("Некорректный ответ от OpenAI API") from e
+def build_multimodal_prompt(title: str, speech: str, screen_text: str, visual: str) -> str:
+    """Промпт финального пересказа видеофайла.
 
-    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    if not content:
-        log.error("OpenAI summary empty content: %s", str(data)[:1000])
-        raise SummaryError("OpenAI API вернул пустой ответ")
-    return content.strip()
+    Главное отличие от старого build_video_summary_prompt: жёсткая рамка
+    «суть / идеи / практические выводы» убрана. На разговорном видео она
+    заставляла модель выжимать несуществующие «выводы» и выбрасывать сам
+    разговор. Теперь речь — приоритет, а картинка и текст с экрана идут
+    отдельными блоками и только как дополнение.
+    """
+    blocks = [f"НАЗВАНИЕ: {title}"]
+    if speech:
+        blocks.append(
+            "РАСШИФРОВКА РЕЧИ (может содержать разметку по говорящим и таймкоды):\n" + speech
+        )
+    else:
+        blocks.append("РАСШИФРОВКА РЕЧИ: речь не распознана или её нет.")
+    if screen_text:
+        blocks.append("ТЕКСТ, РАСПОЗНАННЫЙ НА ЭКРАНЕ:\n" + screen_text)
+    if visual:
+        blocks.append("ОПИСАНИЕ ВИДЕОРЯДА:\n" + visual)
+
+    return (
+        "Ты пересказываешь содержание видео человеку, который его не смотрел.\n"
+        f"Язык ответа: {SUMMARY_LANG}.\n\n"
+        "ГЛАВНОЕ: если в видео говорят — основа ответа это то, О ЧЁМ говорят. "
+        "Передай содержание разговора подробно: какие темы поднимают, какие "
+        "аргументы и факты звучат, к чему приходят. Если это диалог или интервью — "
+        "покажи, кто какую позицию занимает и как развивается разговор. "
+        "Приводи show-stopper реплики дословно в кавычках там, где формулировка важна. "
+        "Не сжимай разговор до пары общих фраз — потерять содержание речи хуже, "
+        "чем написать длиннее.\n\n"
+        "Структура ответа:\n"
+        "1. «О чём видео» — 2-3 предложения по сути.\n"
+        "2. «Содержание» — подробный пересказ того, что говорят и что происходит, "
+        "по ходу видео. Основной и самый объёмный блок. Разбей на абзацы или пункты.\n"
+        "3. «Текст на экране» — если распознан: перечисли, что написано. "
+        "Блок целиком опусти, если текста нет.\n"
+        "4. «Что показано» — 2-4 предложения про картинку: место, люди, формат. "
+        "Опусти, если видеоряд ничего не добавляет.\n"
+        "5. «Итог» — 1-2 предложения.\n\n"
+        "Правила:\n"
+        "- Не выдумывай факты и имена, которых нет в материалах.\n"
+        "- Если речь не распознана, честно скажи это в начале и опиши видео "
+        "по тексту с экрана и картинке.\n"
+        "- Метки «Говорящий A/B» заменяй на роли или имена, если они понятны "
+        "из контекста; иначе пиши «первый собеседник», «второй собеседник».\n"
+        "- Без служебных пометок и markdown-заголовков с решётками, "
+        "названия блоков пиши обычным текстом.\n\n"
+        "МАТЕРИАЛЫ:\n\n" + "\n\n".join(blocks)
+    )
 
 
-async def request_summary_with_fallback(platform: str, video_url: str, title: str, content_text: str) -> str:
-    """Пробует Grok, при ошибке — фоллбэк на OpenAI."""
-    if XAI_API_KEY:
+async def summarize_multimodal(
+    title: str, speech: str, screen_text: str = "", visual: str = "", video_url: str = ""
+) -> str:
+    """Финальный пересказ видео одним проходом сильной модели.
+
+    Раньше здесь стояла цепочка «черновой конспект → переписать черновик»:
+    второй проход пересказывал уже сжатый текст и стабильно терял реплики.
+    """
+    system_prompt = (
+        "Ты внимательный ассистент, который подробно и точно "
+        "пересказывает содержание видео на русском языке."
+    )
+    user_prompt = build_multimodal_prompt(title, speech, screen_text, visual)
+
+    text = ""
+    if USE_GROK and XAI_API_KEY:
         try:
-            return await request_grok_summary(platform, video_url, title, content_text)
+            text = await request_grok_chat(system_prompt, user_prompt, SUMMARY_MAX_TOKENS)
         except SummaryError as e:
-            if OPENAI_API_KEY:
-                log.warning("Grok недоступен (%s), переключаюсь на OpenAI", e)
-            else:
+            if not OPENAI_API_KEY:
                 raise
-    return await request_openai_summary(platform, video_url, title, content_text)
+            log.warning("Grok недоступен (%s), переключаюсь на OpenAI", e)
 
-
-async def request_openai_rewrite(video_url: str, platform: str, draft_summary: str) -> str:
-    if not OPENAI_API_KEY:
-        log.info("OPENAI_API_KEY не задан, пропускаю редактуру через ChatGPT")
-        return f"{draft_summary.strip()}\n\nВидео: {video_url}"
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "temperature": 0.2,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Ты редактор текста. Делай читабельный, грамотный, структурированный текст на русском языке."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Перепиши черновой суммариз в финальный формат.\n"
-                    "Требования:\n"
-                    "- Без таймкодов и служебных пометок.\n"
-                    "- Сохрани факты и смысл.\n"
-                    "- Структура: вводный абзац + ключевые мысли + практический вывод.\n"
-                    f"- Платформа: {platform}\n"
-                    f"- В конец добавь строку: Видео: {video_url}\n\n"
-                    f"Черновой суммариз:\n{draft_summary}"
-                ),
-            },
-        ],
-    }
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    try:
-        async with httpx.AsyncClient(timeout=90) as client:
-            resp = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPStatusError as e:
-        body = e.response.text[:900] if e.response is not None else ""
-        log.error("OpenAI API HTTP error: status=%s body=%s", e.response.status_code if e.response else "n/a", body)
-        raise SummaryError(f"OpenAI API вернул HTTP {e.response.status_code}") from e
-    except httpx.HTTPError as e:
-        log.error("OpenAI API network error: %s", e)
-        raise SummaryError("Сетевой сбой при запросе к OpenAI API") from e
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
-        log.error("OpenAI API parse error: %s", e)
-        raise SummaryError("Некорректный ответ от OpenAI API") from e
-
-    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    if not content:
-        log.error("OpenAI API empty content: %s", str(data)[:1000])
-        raise SummaryError("OpenAI API вернул пустой ответ")
-    return content.strip()
+    if not text:
+        text = await openai_chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            model=SUMMARY_MODEL,
+            max_tokens=SUMMARY_MAX_TOKENS,
+            timeout=300,
+            what="OpenAI (пересказ)",
+        )
+    if video_url:
+        text = f"{text}\n\nВидео: {video_url}"
+    return text
 
 
 async def request_openai_comments_summary(video_url: str, platform: str, comments: list[dict]) -> str:
@@ -477,10 +538,8 @@ async def request_openai_comments_summary(video_url: str, platform: str, comment
             lines.append(f"- ({c.get('likes', 0)} likes) {c.get('text', '')}")
         return "\n".join(lines)
 
-    payload = {
-        "model": OPENAI_MODEL,
-        "temperature": 0.2,
-        "messages": [
+    return await openai_chat(
+        [
             {
                 "role": "system",
                 "content": "Ты аналитик пользовательских комментариев. Пиши ясно и по делу на русском языке.",
@@ -502,28 +561,11 @@ async def request_openai_comments_summary(video_url: str, platform: str, comment
                 ),
             },
         ],
-    }
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    try:
-        async with httpx.AsyncClient(timeout=90) as client:
-            resp = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPStatusError as e:
-        body = e.response.text[:900] if e.response is not None else ""
-        log.error("OpenAI comments HTTP error: status=%s body=%s", e.response.status_code if e.response else "n/a", body)
-        raise SummaryError(f"OpenAI API (комментарии) вернул HTTP {e.response.status_code}") from e
-    except httpx.HTTPError as e:
-        log.error("OpenAI comments network error: %s", e)
-        raise SummaryError("Сетевой сбой при анализе комментариев") from e
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
-        log.error("OpenAI comments parse error: %s", e)
-        raise SummaryError("Некорректный ответ OpenAI при анализе комментариев") from e
-
-    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    if not content:
-        raise SummaryError("OpenAI API вернул пустой анализ комментариев")
-    return content.strip()
+        model=OPENAI_MODEL,
+        max_tokens=1500,
+        timeout=90,
+        what="OpenAI (комментарии)",
+    )
 
 
 def has_audio_stream(video_path: str) -> bool:
@@ -548,72 +590,233 @@ def extract_audio_ffmpeg(video_path: str, audio_path: str) -> None:
         raise SummaryError(f"ffmpeg error: {err[-400:]}")
 
 
-def extract_frames_ffmpeg(video_path: str, frames_dir: str, n_frames: int = 6) -> list:
-    """Extract n_frames evenly-spaced JPEG frames. Returns sorted list of paths."""
-    dur_probe = subprocess.run(
+def probe_duration(path: str) -> float:
+    """Длительность медиафайла в секундах (0.0, если ffprobe не смог)."""
+    probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "csv=p=0", video_path],
+         "-of", "csv=p=0", path],
         capture_output=True, timeout=30,
     )
-    duration = float(dur_probe.stdout.strip() or "10")
-    interval = max(duration / n_frames, 0.5)
+    try:
+        return float(probe.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def extract_frames_ffmpeg(video_path: str, frames_dir: str) -> list:
+    """Нарезает кадры примерно раз в VISION_FRAME_EVERY_SEC секунд.
+
+    Раньше бралось ровно 6 кадров на любое видео, поэтому у длинного ролика
+    между соседними кадрами выпадали минуты — вместе с надписями на экране.
+    Число кадров теперь зависит от длительности и упирается в VISION_MAX_FRAMES.
+    Качество JPEG высокое (-q:v 2): кадр уходит в OCR, артефакты сжатия мешают
+    читать мелкий текст.
+    """
+    duration = probe_duration(video_path) or 10.0
+    n_frames = int(min(VISION_MAX_FRAMES, max(4, duration // VISION_FRAME_EVERY_SEC)))
+    interval = max(duration / n_frames, 0.3)
     subprocess.run(
         ["ffmpeg", "-y", "-i", video_path, "-vf", f"fps=1/{interval:.2f}",
-         "-vframes", str(n_frames), "-q:v", "5",
+         "-vframes", str(n_frames), "-q:v", "2",
          os.path.join(frames_dir, "frame_%03d.jpg")],
-        capture_output=True, timeout=120,
+        capture_output=True, timeout=300,
     )
     return sorted(glob.glob(os.path.join(frames_dir, "frame_*.jpg")))
 
 
-async def describe_frames_with_gpt(frame_paths: list) -> str:
-    """Send frames to GPT-4o-mini Vision and return description of video content."""
-    if not OPENAI_API_KEY:
-        raise SummaryError("OPENAI_API_KEY не задан — визуальный анализ недоступен")
-    content = [{
-        "type": "text",
-        "text": (
-            "Перед тобой кадры из короткого видео по порядку. "
-            "Опиши подробно: что происходит, кто или что изображено, "
-            "какой текст виден на экране, какова тема и суть видео. "
-            "Пиши на русском."
-        )
-    }]
-    for path in frame_paths:
+def _frames_as_content(frame_paths: list, instruction: str, duration: float) -> list:
+    """Собирает content-массив для vision-запроса: инструкция + кадры с таймкодами."""
+    content: list = [{"type": "text", "text": instruction}]
+    step = (duration / len(frame_paths)) if (duration and frame_paths) else 0
+    for idx, path in enumerate(frame_paths):
+        if step:
+            ts = int(idx * step)
+            content.append({"type": "text", "text": f"[кадр {idx + 1}, ~{ts // 60:02d}:{ts % 60:02d}]"})
+        else:
+            content.append({"type": "text", "text": f"[кадр {idx + 1}]"})
         with open(path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         content.append({
             "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"}
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": VISION_DETAIL},
         })
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": 1000,
-    }
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+    return content
 
 
-async def transcribe_with_whisper(audio_path: str) -> str:
-    """Transcribe audio file via OpenAI Whisper API. Returns plain text."""
-    if not OPENAI_API_KEY:
-        raise SummaryError("OPENAI_API_KEY не задан — транскрипция через Whisper недоступна")
+async def ocr_frames(frame_paths: list, duration: float = 0.0) -> str:
+    """Распознаёт весь текст, видимый на кадрах.
+
+    Отдельный проход, а не пункт в общем описании: когда OCR был одним из
+    требований в длинной инструкции «опиши что происходит», модель почти всегда
+    ограничивалась пересказом картинки и текст игнорировала.
+    """
+    instruction = (
+        "Ты OCR-движок. Перед тобой кадры из видео по порядку.\n"
+        "Выпиши ДОСЛОВНО весь текст, который видно на кадрах: заголовки, титры, "
+        "субтитры, подписи, надписи на объектах, имена и должности спикеров, "
+        "названия, цифры, даты, ссылки, водяные знаки, текст в интерфейсе.\n\n"
+        "Правила:\n"
+        "- Сохраняй оригинальный язык и написание текста, ничего не переводи.\n"
+        "- Один и тот же текст, висящий на нескольких кадрах, выписывай один раз.\n"
+        "- Группируй по кадрам, указывая таймкод кадра.\n"
+        "- Ничего не додумывай: пиши только то, что реально читается.\n"
+        "- Если текста на кадрах нет вообще, ответь ровно: НЕТ ТЕКСТА"
+    )
+    content = _frames_as_content(frame_paths, instruction, duration)
+    return await openai_chat(
+        [{"role": "user", "content": content}],
+        model=VISION_MODEL,
+        max_tokens=3000,
+        what="OpenAI Vision (OCR)",
+    )
+
+
+async def describe_frames_with_gpt(frame_paths: list, duration: float = 0.0) -> str:
+    """Описывает происходящее на кадрах: сцена, люди, действия, монтаж."""
+    instruction = (
+        "Перед тобой кадры из видео по порядку. Опиши, что происходит в кадре, "
+        "на русском языке.\n\n"
+        "Укажи:\n"
+        "- Кто в кадре: люди, их количество, роли, узнаваемые личности (если уверен).\n"
+        "- Где происходит действие: помещение, студия, сцена, улица, интерьер.\n"
+        "- Что делают: действия, жесты, смена планов, что показывают крупным планом.\n"
+        "- Жанр и формат: интервью, концерт, влог, репортаж, нарезка, реклама.\n"
+        "- Как меняется картинка от кадра к кадру.\n\n"
+        "Текст на экране пересказывать не нужно — его разбирают отдельно. "
+        "Не выдумывай того, чего не видно на кадрах."
+    )
+    content = _frames_as_content(frame_paths, instruction, duration)
+    return await openai_chat(
+        [{"role": "user", "content": content}],
+        model=VISION_MODEL,
+        max_tokens=2000,
+        what="OpenAI Vision (сцена)",
+    )
+
+
+def split_audio_ffmpeg(audio_path: str, out_dir: str, chunk_sec: int) -> list:
+    """Режет аудио на куски по chunk_sec секунд. Возвращает пути по порядку."""
+    os.makedirs(out_dir, exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", audio_path, "-f", "segment",
+         "-segment_time", str(chunk_sec), "-c", "copy",
+         os.path.join(out_dir, "chunk_%03d.mp3")],
+        capture_output=True, timeout=600,
+    )
+    return sorted(glob.glob(os.path.join(out_dir, "chunk_*.mp3")))
+
+
+def _format_diarized(segments: list, offset_sec: float = 0.0) -> str:
+    """Склеивает подряд идущие сегменты одного говорящего в реплики.
+
+    API возвращает сегменты уровня нескольких слов, поэтому без склейки диалог
+    выглядел бы как список обрывков вместо реплик.
+    """
+    turns: list[dict] = []
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        speaker = seg.get("speaker") or "?"
+        if turns and turns[-1]["speaker"] == speaker:
+            turns[-1]["text"] += " " + text
+        else:
+            turns.append({
+                "speaker": speaker,
+                "text": text,
+                "start": float(seg.get("start") or 0.0) + offset_sec,
+            })
+    lines = []
+    for turn in turns:
+        ts = int(turn["start"])
+        lines.append(f"[{ts // 60:02d}:{ts % 60:02d}] Говорящий {turn['speaker']}: {turn['text'].strip()}")
+    return "\n".join(lines)
+
+
+async def _transcribe_chunk(path: str, model: str, offset_sec: float, hint: str) -> str:
+    """Транскрибирует один кусок аудио. Diarize-модель отдаёт реплики по ролям."""
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    with open(audio_path, "rb") as f:
+    with open(path, "rb") as f:
         audio_bytes = f.read()
-    async with httpx.AsyncClient(timeout=300) as client:
+
+    diarize = "diarize" in model
+    data = {"model": model}
+    if diarize:
+        data["response_format"] = "diarized_json"
+        # Обязательный для diarize-моделей параметр: без него API отвечает 400.
+        data["chunking_strategy"] = "auto"
+    else:
+        data["response_format"] = "json"
+    if SUMMARY_LANG:
+        data["language"] = SUMMARY_LANG
+    # Подсказка помогает модели не терять имена собственные и термины, но
+    # diarize-модели отвергают её с HTTP 400 «Prompt is not supported for
+    # diarization models», а whisper-1 трактует иначе — шлём только обычным.
+    if hint and not diarize and model != "whisper-1":
+        data["prompt"] = hint
+
+    async with httpx.AsyncClient(timeout=600) as client:
         resp = await client.post(
             f"{OPENAI_BASE_URL}/audio/transcriptions",
             headers=headers,
-            files={"file": (os.path.basename(audio_path), audio_bytes, "audio/mpeg")},
-            data={"model": "whisper-1", "response_format": "text"},
+            files={"file": (os.path.basename(path), audio_bytes, "audio/mpeg")},
+            data=data,
         )
         resp.raise_for_status()
-        return resp.text.strip()
+        payload = resp.json()
+
+    if diarize and payload.get("segments"):
+        formatted = _format_diarized(payload["segments"], offset_sec)
+        if formatted:
+            return formatted
+    return (payload.get("text") or "").strip()
+
+
+async def transcribe_audio(audio_path: str, hint: str = "") -> str:
+    """Распознаёт речь целиком, при необходимости разбивая аудио на куски.
+
+    Порядок моделей: diarize (реплики по говорящим) → gpt-4o-transcribe →
+    whisper-1. Прежний код звал только whisper-1 без языка и подсказки, из-за
+    чего на музыке и шумной записи возвращал пару строк вместо разговора.
+    """
+    if not OPENAI_API_KEY:
+        raise SummaryError("OPENAI_API_KEY не задан — распознавание речи недоступно")
+
+    size = os.path.getsize(audio_path)
+    duration = probe_duration(audio_path)
+    tmp_chunk_dir = os.path.join(os.path.dirname(audio_path), "achunks")
+
+    if size > WHISPER_SIZE_LIMIT or (duration and duration > AUDIO_CHUNK_SEC):
+        chunks = await asyncio.to_thread(split_audio_ffmpeg, audio_path, tmp_chunk_dir, AUDIO_CHUNK_SEC)
+        if not chunks:
+            chunks = [audio_path]
+    else:
+        chunks = [audio_path]
+
+    log.info("transcribe: chunks=%s duration=%.0fs size=%s", len(chunks), duration, size)
+
+    last_err: Exception | None = None
+    for model in [TRANSCRIBE_MODEL] + [m for m in TRANSCRIBE_FALLBACKS if m != TRANSCRIBE_MODEL]:
+        try:
+            results = await asyncio.gather(*[
+                _transcribe_chunk(chunk, model, idx * AUDIO_CHUNK_SEC, hint)
+                for idx, chunk in enumerate(chunks)
+            ])
+            text = "\n".join(part for part in results if part).strip()
+            if text:
+                log.info("transcribe: модель=%s chars=%s", model, len(text))
+                return text
+            last_err = SummaryError(f"{model} вернул пустую расшифровку")
+            log.warning("transcribe: %s вернул пусто, пробую следующую модель", model)
+        except Exception as e:
+            body = ""
+            if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                body = e.response.text[:300]
+            log.warning("transcribe: модель %s не сработала: %s %s", model, e, body)
+            last_err = e
+
+    log.error("transcribe: все модели исчерпаны: %s", last_err)
+    return ""
 
 
 # === MTProto-клиент для больших файлов (лениво, один на процесс) ===
@@ -717,59 +920,68 @@ async def summarize_video_file_and_reply(update: Update, file_id: str, file_name
             await file_obj.download_to_drive(video_path)
         log.info("videofile.downloaded trace=%s bytes=%s", trace_id, os.path.getsize(video_path))
 
-        # 2. Extract frames + audio in parallel (frames always, audio only if stream exists)
+        # 2. Кадры и аудио: кадры режем всегда, аудио — только если дорожка есть
         frames_dir = os.path.join(tmpdir, "frames")
         os.makedirs(frames_dir, exist_ok=True)
         video_has_audio = await asyncio.to_thread(has_audio_stream, video_path)
+        duration = await asyncio.to_thread(probe_duration, video_path)
 
+        await status_msg.edit_text("🔊 Извлекаю кадры и аудио..." if video_has_audio
+                                  else "🖼 Аудиодорожки нет — извлекаю кадры...")
+        extract_jobs = [asyncio.to_thread(extract_frames_ffmpeg, video_path, frames_dir)]
         if video_has_audio:
-            await status_msg.edit_text("🔊 Извлекаю аудио и кадры...")
-            await asyncio.gather(
-                asyncio.to_thread(extract_audio_ffmpeg, video_path, audio_path),
-                asyncio.to_thread(extract_frames_ffmpeg, video_path, frames_dir),
-            )
-            audio_size = os.path.getsize(audio_path)
-            log.info("videofile.audio trace=%s audio_bytes=%s", trace_id, audio_size)
-            if audio_size > 25 * 1024 * 1024:
-                raise SummaryError("Аудиодорожка слишком длинная даже после сжатия (>25 МБ для Whisper). Обрежь видео.")
-            frame_paths = sorted(glob.glob(os.path.join(frames_dir, "frame_*.jpg")))
-            await status_msg.edit_text("🎙 Распознаю речь и анализирую кадры...")
-            tasks = [transcribe_with_whisper(audio_path)]
-            if frame_paths:
-                tasks.append(describe_frames_with_gpt(frame_paths))
-            results = await asyncio.gather(*tasks)
-            transcript_audio = results[0]
-            transcript_visual = results[1] if len(results) > 1 else ""
-            log.info("videofile.audio_transcript trace=%s chars=%s", trace_id, len(transcript_audio))
-            if transcript_visual:
-                log.info("videofile.visual_transcript trace=%s chars=%s", trace_id, len(transcript_visual))
-            parts = []
-            if transcript_audio:
-                parts.append("[АУДИОДОРОЖКА]:\n" + transcript_audio)
-            if transcript_visual:
-                parts.append("[ВИЗУАЛЬНЫЙ РЯД]:\n" + transcript_visual)
-            transcript = ("\n\n").join(parts)
-            if not transcript:
-                raise SummaryError("Whisper не распознал речь и кадры не извлечены")
-        else:
-            await status_msg.edit_text("🖼 Аудио нет — анализирую видеоряд по кадрам...")
-            frame_paths = await asyncio.to_thread(extract_frames_ffmpeg, video_path, frames_dir)
-            if not frame_paths:
-                raise SummaryError("Не удалось извлечь кадры из видео")
-            log.info("videofile.frames trace=%s count=%s", trace_id, len(frame_paths))
-            transcript = await describe_frames_with_gpt(frame_paths)
+            extract_jobs.append(asyncio.to_thread(extract_audio_ffmpeg, video_path, audio_path))
+        extract_results = await asyncio.gather(*extract_jobs)
+        frame_paths = extract_results[0]
+        log.info("videofile.frames trace=%s count=%s duration=%.0fs",
+                 trace_id, len(frame_paths), duration)
 
-        log.info("videofile.transcript trace=%s total_chars=%s", trace_id, len(transcript))
+        # 3. Три независимых анализа параллельно: речь, текст на экране, картинка
+        await status_msg.edit_text("🎙 Распознаю речь, текст на экране и видеоряд...")
+        hint = f"Видео: {file_name}." if file_name else ""
+        jobs = {}
+        if video_has_audio:
+            log.info("videofile.audio trace=%s audio_bytes=%s", trace_id, os.path.getsize(audio_path))
+            jobs["speech"] = transcribe_audio(audio_path, hint)
+        if frame_paths:
+            jobs["screen_text"] = ocr_frames(frame_paths, duration)
+            jobs["visual"] = describe_frames_with_gpt(frame_paths, duration)
 
-        # 4. Summarize via Grok (or OpenAI fallback)
-        await status_msg.edit_text("🤖 Анализирую содержимое...")
+        if not jobs:
+            raise SummaryError("Из файла не удалось извлечь ни звук, ни кадры")
+
+        # return_exceptions: сбой OCR не должен ронять весь разбор, если речь распозналась
+        done = await asyncio.gather(*jobs.values(), return_exceptions=True)
+        collected: dict[str, str] = {}
+        for key, value in zip(jobs.keys(), done):
+            if isinstance(value, Exception):
+                log.warning("videofile.%s trace=%s failed: %s", key, trace_id, value)
+                collected[key] = ""
+            else:
+                collected[key] = value or ""
+
+        speech = collected.get("speech", "")
+        screen_text = collected.get("screen_text", "")
+        visual = collected.get("visual", "")
+        if screen_text.strip().upper().startswith("НЕТ ТЕКСТА"):
+            screen_text = ""
+
+        log.info("videofile.parts trace=%s speech=%s screen_text=%s visual=%s",
+                 trace_id, len(speech), len(screen_text), len(visual))
+
+        if not (speech or screen_text or visual):
+            raise SummaryError("Не удалось распознать ни речь, ни текст на экране, ни видеоряд")
+
+        # 4. Финальный пересказ — один проход сильной модели, без переписывания черновика
+        await status_msg.edit_text("🤖 Собираю пересказ...")
         title = file_name or "Видеофайл"
-        raw_summary = await request_summary_with_fallback("file", title, title, transcript[:MAX_TRANSCRIPT_CHARS])
-        log.info("videofile.summary.ok trace=%s", trace_id)
-
-        # 5. Rewrite via OpenAI
-        final_summary = await request_openai_rewrite(title, "file", raw_summary)
-        log.info("videofile.openai.ok trace=%s", trace_id)
+        final_summary = await summarize_multimodal(
+            title,
+            speech[:MAX_TRANSCRIPT_CHARS],
+            screen_text[:MAX_TRANSCRIPT_CHARS],
+            visual[:MAX_TRANSCRIPT_CHARS],
+        )
+        log.info("videofile.summary.ok trace=%s chars=%s", trace_id, len(final_summary))
 
         await status_msg.delete()
 
@@ -818,13 +1030,15 @@ async def summarize_video_and_reply(update: Update, url: str):
         content_text = await asyncio.to_thread(build_content_text, platform, url, info)
         log.info("sum.content.ok trace=%s chars=%s", trace_id, len(content_text))
 
-        log.info("sum.summary.request trace=%s", trace_id)
-        raw_summary = await request_summary_with_fallback(platform, url, title, content_text)
-        log.info("sum.summary.ok trace=%s chars=%s", trace_id, len(raw_summary))
-
-        log.info("sum.openai.video.request trace=%s model=%s", trace_id, OPENAI_MODEL)
-        final_video_summary = await request_openai_rewrite(url, platform, raw_summary)
-        log.info("sum.openai.video.ok trace=%s chars=%s", trace_id, len(final_video_summary))
+        # Субтитры/расшифровка ролика — такая же «речь», что и у видеофайла,
+        # поэтому ссылки идут через тот же подробный пересказ в один проход.
+        log.info("sum.summary.request trace=%s model=%s", trace_id, SUMMARY_MODEL)
+        final_video_summary = await summarize_multimodal(
+            title,
+            content_text[:MAX_TRANSCRIPT_CHARS],
+            video_url=url,
+        )
+        log.info("sum.summary.ok trace=%s chars=%s", trace_id, len(final_video_summary))
 
         comments = await asyncio.to_thread(extract_comments, info)
         log.info("sum.comments.extract trace=%s count=%s", trace_id, len(comments))
@@ -860,8 +1074,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я суммаризатор видео.\n\n"
         "Что умею:\n"
-        "• YouTube / TikTok ссылка — суммариз + анализ комментариев\n"
-        "• Видеофайл (до 2 ГБ) — транскрипция через Whisper + суммариз\n\n"
+        "• YouTube / TikTok ссылка — подробный пересказ + анализ комментариев\n"
+        "• Видеофайл (до 2 ГБ) — распознаю речь с разделением по говорящим, "
+        "читаю текст на экране и описываю видеоряд\n\n"
         "Команды:\n"
         "/sum <url> — суммаризировать видео по ссылке\n\n"
         "Или просто пришли ссылку / видеофайл 🎥"

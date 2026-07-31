@@ -9,3 +9,4 @@ graphify-out/
 *.db
 *.sqlite3
 summarizvid_mtproto.session
+*.session-journal
