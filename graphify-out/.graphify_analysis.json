@@ -1,0 +1,261 @@
+{
+  "communities": {
+    "0": [
+      "exception",
+      "summarizvid_extract_audio_ffmpeg",
+      "summarizvid_extract_frames_ffmpeg",
+      "summarizvid_has_audio_stream",
+      "summarizvid_probe_duration",
+      "summarizvid_rationale_579",
+      "summarizvid_rationale_589",
+      "summarizvid_rationale_601",
+      "summarizvid_rationale_614",
+      "summarizvid_rationale_705",
+      "summarizvid_rationale_783",
+      "summarizvid_split_audio_ffmpeg",
+      "summarizvid_summarize_video_file_and_reply",
+      "summarizvid_summaryerror",
+      "summarizvid_transcribe_audio"
+    ],
+    "1": [
+      "summarizvid",
+      "summarizvid_build_content_text",
+      "summarizvid_detect_platform",
+      "summarizvid_extract_comments",
+      "summarizvid_extract_youtube_video_id",
+      "summarizvid_fetch_media_info",
+      "summarizvid_fetch_text_from_subtitles",
+      "summarizvid_fetch_youtube_transcript",
+      "summarizvid_normalize_text",
+      "summarizvid_parse_subtitle_payload",
+      "summarizvid_request_openai_comments_summary",
+      "summarizvid_summarize_video_and_reply"
+    ],
+    "2": [
+      "default_type",
+      "summarizvid_allowed",
+      "summarizvid_cmd_ping",
+      "summarizvid_cmd_start",
+      "summarizvid_cmd_sum",
+      "summarizvid_get_url_from_text",
+      "summarizvid_main",
+      "summarizvid_on_text",
+      "summarizvid_on_video_file",
+      "update"
+    ],
+    "3": [
+      "summarizvid_describe_frames_with_gpt",
+      "summarizvid_frames_as_content",
+      "summarizvid_ocr_frames",
+      "summarizvid_openai_chat",
+      "summarizvid_rationale_314",
+      "summarizvid_rationale_327",
+      "summarizvid_rationale_635",
+      "summarizvid_rationale_654",
+      "summarizvid_rationale_682",
+      "summarizvid_uses_completion_tokens"
+    ],
+    "4": [
+      "bot_logging",
+      "bot_logging_make_handler",
+      "bot_logging_make_stream_handler",
+      "bot_logging_rationale_1",
+      "bot_logging_setup_bot_logging",
+      "logger",
+      "path"
+    ],
+    "5": [
+      "summarizvid_build_multimodal_prompt",
+      "summarizvid_rationale_379",
+      "summarizvid_rationale_427",
+      "summarizvid_rationale_488",
+      "summarizvid_request_grok_chat",
+      "summarizvid_summarize_multimodal"
+    ],
+    "6": [
+      "summarizvid_download_via_mtproto",
+      "summarizvid_get_mtproto_client",
+      "summarizvid_post_init",
+      "summarizvid_rationale_1138",
+      "summarizvid_rationale_835",
+      "summarizvid_rationale_847"
+    ],
+    "7": [
+      "summarizvid_format_diarized",
+      "summarizvid_rationale_717",
+      "summarizvid_rationale_744",
+      "summarizvid_transcribe_chunk"
+    ],
+    "8": [
+      "install",
+      "install_sh__entry"
+    ],
+    "9": [
+      "restart",
+      "restart_sh__entry"
+    ],
+    "10": [
+      "start",
+      "start_sh__entry"
+    ],
+    "11": [
+      "stop",
+      "stop_sh__entry"
+    ]
+  },
+  "cohesion": {
+    "0": 0.17142857142857143,
+    "1": 0.3787878787878788,
+    "2": 0.4666666666666667,
+    "3": 0.2222222222222222,
+    "4": 0.42857142857142855,
+    "5": 0.3333333333333333,
+    "6": 0.3333333333333333,
+    "7": 0.5,
+    "8": 1.0,
+    "9": 1.0,
+    "10": 1.0,
+    "11": 1.0
+  },
+  "gods": [
+    {
+      "id": "summarizvid_summarize_video_file_and_reply",
+      "label": "summarize_video_file_and_reply()",
+      "degree": 13
+    },
+    {
+      "id": "summarizvid_summarize_video_and_reply",
+      "label": "summarize_video_and_reply()",
+      "degree": 11
+    },
+    {
+      "id": "summarizvid_summaryerror",
+      "label": "SummaryError",
+      "degree": 9
+    },
+    {
+      "id": "summarizvid_on_text",
+      "label": "on_text()",
+      "degree": 8
+    },
+    {
+      "id": "summarizvid_openai_chat",
+      "label": "openai_chat()",
+      "degree": 8
+    },
+    {
+      "id": "summarizvid_transcribe_audio",
+      "label": "transcribe_audio()",
+      "degree": 7
+    },
+    {
+      "id": "summarizvid_build_content_text",
+      "label": "build_content_text()",
+      "degree": 7
+    },
+    {
+      "id": "summarizvid_main",
+      "label": "main()",
+      "degree": 7
+    },
+    {
+      "id": "summarizvid_summarize_multimodal",
+      "label": "summarize_multimodal()",
+      "degree": 7
+    },
+    {
+      "id": "summarizvid_normalize_text",
+      "label": "normalize_text()",
+      "degree": 6
+    }
+  ],
+  "surprises": [
+    {
+      "source": "main()",
+      "target": "_post_init()",
+      "source_files": [
+        "summarizvid.py",
+        "summarizvid.py"
+      ],
+      "confidence": "INFERRED",
+      "relation": "indirect_call",
+      "note": "Bridges community 2 → community 6"
+    },
+    {
+      "source": "build_content_text()",
+      "target": "SummaryError",
+      "source_files": [
+        "summarizvid.py",
+        "summarizvid.py"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 0 → community 1"
+    },
+    {
+      "source": "download_via_mtproto()",
+      "target": "SummaryError",
+      "source_files": [
+        "summarizvid.py",
+        "summarizvid.py"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 0 → community 6"
+    },
+    {
+      "source": "openai_chat()",
+      "target": "SummaryError",
+      "source_files": [
+        "summarizvid.py",
+        "summarizvid.py"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 0 → community 3"
+    },
+    {
+      "source": "request_grok_chat()",
+      "target": "SummaryError",
+      "source_files": [
+        "summarizvid.py",
+        "summarizvid.py"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 0 → community 5"
+    }
+  ],
+  "questions": [
+    {
+      "type": "bridge_node",
+      "question": "Why does `setup_bot_logging()` connect `Community 4` to `Community 1`?",
+      "why": "High betweenness centrality (0.067) - this node is a cross-community bridge."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `summarize_video_file_and_reply()` connect `Community 0` to `Community 1`, `Community 2`, `Community 3`, `Community 5`, `Community 6`?",
+      "why": "High betweenness centrality (0.038) - this node is a cross-community bridge."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `SummaryError` connect `Community 0` to `Community 1`, `Community 3`, `Community 5`, `Community 6`?",
+      "why": "High betweenness centrality (0.032) - this node is a cross-community bridge."
+    },
+    {
+      "type": "verify_inferred",
+      "question": "Are the 4 inferred relationships involving `summarize_video_file_and_reply()` (e.g. with `extract_audio_ffmpeg()` and `extract_frames_ffmpeg()`) actually correct?",
+      "why": "`summarize_video_file_and_reply()` has 4 INFERRED edges - model-reasoned connections that need verification."
+    },
+    {
+      "type": "verify_inferred",
+      "question": "Are the 3 inferred relationships involving `summarize_video_and_reply()` (e.g. with `build_content_text()` and `extract_comments()`) actually correct?",
+      "why": "`summarize_video_and_reply()` has 3 INFERRED edges - model-reasoned connections that need verification."
+    },
+    {
+      "type": "isolated_nodes",
+      "question": "What connects `start.sh script`, `stop.sh script`, `install.sh script` to the rest of the system?",
+      "why": "4 weakly-connected nodes found - possible documentation gaps or missing edges."
+    }
+  ]
+}

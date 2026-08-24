@@ -1,0 +1,38 @@
+{
+  "bot_logging.py": {
+    "mtime": 1785419766.301,
+    "seen": 1787568242.6650505,
+    "ast_hash": "aab69fcbde6229f133a43a2309b8d4e1",
+    "semantic_hash": "aab69fcbde6229f133a43a2309b8d4e1"
+  },
+  "install.sh": {
+    "mtime": 1785419768.48,
+    "seen": 1787568242.665055,
+    "ast_hash": "12b17411f5a1834d6343f185e44f6b92",
+    "semantic_hash": "12b17411f5a1834d6343f185e44f6b92"
+  },
+  "restart.sh": {
+    "mtime": 1785419768.51,
+    "seen": 1787568242.665057,
+    "ast_hash": "fd1789aa46bbdd51e1d70ded308f06be",
+    "semantic_hash": "fd1789aa46bbdd51e1d70ded308f06be"
+  },
+  "start.sh": {
+    "mtime": 1785419768.522,
+    "seen": 1787568242.6650581,
+    "ast_hash": "ef7755ba03990c765b895b3638de448e",
+    "semantic_hash": "ef7755ba03990c765b895b3638de448e"
+  },
+  "stop.sh": {
+    "mtime": 1785419768.534,
+    "seen": 1787568242.665059,
+    "ast_hash": "714aaf429f0e733a0739f199eaae43ec",
+    "semantic_hash": "714aaf429f0e733a0739f199eaae43ec"
+  },
+  "summarizvid.py": {
+    "mtime": 1787561748.1,
+    "seen": 1787568242.66506,
+    "ast_hash": "377123acccc5e3f286734ee0dfb395e3",
+    "semantic_hash": "377123acccc5e3f286734ee0dfb395e3"
+  }
+}

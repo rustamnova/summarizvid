@@ -1,0 +1,6 @@
+cache/
+.graphify_root
+.graphify_python
+memory/
+reflections/
+converted/
