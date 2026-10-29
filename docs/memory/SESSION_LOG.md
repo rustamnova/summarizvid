@@ -21,3 +21,14 @@ full chat transcripts outside the repository.
 - Decisions: Use `AGENTS.md` plus `docs/memory/` as the portable memory contract.
 - Next: Replace placeholders with verified project-specific context during the next
   material work session.
+
+## 2026-10-30 — Related links feature
+
+- Objective: Give links to the video's main topic (search + concrete pages).
+- Changes: `find_related_links` in `summarizvid.py`, wired into URL and video-file
+  flows (URL flow runs in parallel with comments); README and `.env.example` updated.
+- Validation: `py_compile` OK; offline test with mocked HTTP confirmed filtering of
+  search engines, dead links and the video's own URL. Live OpenAI web_search and
+  Telegram not tested (no `.env`/deps locally); not deployed.
+- Next: Deploy to server, test on a real video, check that `RELATED_MODEL`
+  (defaults to `SUMMARY_MODEL`) supports `web_search`.

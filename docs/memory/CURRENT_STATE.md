@@ -1,7 +1,7 @@
 # Current State
 
 - Project: `summariz`
-- Last memory update: 2026-08-24
+- Last memory update: 2026-10-30
 - Branch/upstream: `main` / `origin/main`
 - Git HEAD: `81c4d56`
 - Sync: 0 ahead / 0 behind
@@ -28,3 +28,7 @@
 
 1. Run project-specific tests for the new video-analysis path.
 2. Review and publish portable memory in a scoped Git change.
+
+## 2026-10-30 update
+
+- Related-links block implemented locally (uncommitted, not deployed). Mock-tested only.

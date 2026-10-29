@@ -12,7 +12,7 @@ import base64
 import glob
 import shutil
 import tempfile
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote_plus
 
 from bot_logging import setup_bot_logging
 
@@ -63,6 +63,11 @@ TELETHON_API_ID = int(os.getenv("TELETHON_API_ID", "0"))
 TELETHON_API_HASH = os.getenv("TELETHON_API_HASH", "").strip()
 MTPROTO_SESSION = os.path.join(BASE_DIR, "summarizvid_mtproto")
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "2000"))  # жёсткий потолок Telegram — 2 ГБ
+
+# Блок «Узнать больше»: ссылки поиска + найденные страницы по главной теме видео.
+RELATED_LINKS = os.getenv("RELATED_LINKS", "1").strip().lower() in {"1", "true", "yes"}
+RELATED_MODEL = os.getenv("RELATED_MODEL", "").strip() or SUMMARY_MODEL
+RELATED_TIMEOUT = float(os.getenv("RELATED_TIMEOUT", "90"))
 
 SUMMARY_LANG = os.getenv("SUMMARY_LANG", "ru").strip()
 # Финальный пересказ намеренно длиннее прежних 900 токенов (MAX_OUTPUT_TOKENS):
@@ -519,6 +524,120 @@ async def summarize_multimodal(
     if video_url:
         text = f"{text}\n\nВидео: {video_url}"
     return text
+
+
+# ---------------------------
+# Ссылки по теме видео (по образцу posterrec: поиск Яндекс/Google + веб-поиск OpenAI)
+# ---------------------------
+_RELATED_BAD_HOSTS = ("yandex.", "ya.ru", "google.", "bing.com", "duckduckgo.com", "clck.ru",
+                      "youtube.com", "youtu.be", "tiktok.com")
+
+_RELATED_PROMPT = (
+    "Ниже краткий пересказ видео. Определи ГЛАВНУЮ ТЕМУ (фабулу, основную мысль), "
+    "а не мелкие детали, и найди в интернете 1-3 конкретные страницы по ней: "
+    "репозиторий, если речь о коде; страница игры, продукта или сервиса, если говорят о них; "
+    "новостная статья или подробный материал по событию.\n"
+    "Требования:\n"
+    "- ссылки ведут на конкретные страницы по теме, а не на поисковики, главные страницы "
+    "сайтов и не на само это видео;\n"
+    "- предпочитай первоисточники (официальный сайт, GitHub, крупные издания);\n"
+    "- если уверенных ссылок нет — верни пустой список, ничего не выдумывай.\n"
+    'Ответ строго в JSON: {"query": "<поисковый запрос 3-8 слов по главной теме>", '
+    '"links": [{"title": "<короткое название>", "url": "<url>"}]}\n\n'
+    "Пересказ видео:\n"
+)
+
+
+async def _shorten_url(long_url: str) -> str:
+    """Сокращает URL через clck.ru. При ошибке возвращает исходный URL."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get("https://clck.ru/--", params={"url": long_url})
+        short = resp.text.strip()
+        if resp.status_code == 200 and short.startswith("https://clck.ru/"):
+            return short
+    except Exception:
+        log.warning("clck.ru недоступен для %s", long_url[:60])
+    return long_url
+
+
+async def _url_is_alive(url: str) -> bool:
+    """Отсекает выдуманные моделью URL. Антибот-коды (401/403/405/429) считаем живой страницей."""
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; SummarizBot/1.0)"})
+    except Exception:
+        return False
+    return resp.status_code < 400 or resp.status_code in (401, 403, 405, 429)
+
+
+async def find_related_links(title: str, summary: str, own_url: str = "") -> str:
+    """Блок «Узнать больше»: поиск Яндекс/Google по главной теме + найденные страницы.
+
+    Никогда не бросает исключений: пересказ важнее ссылок.
+    """
+    if not RELATED_LINKS:
+        return ""
+    query, links = "", []
+    try:
+        if OPENAI_API_KEY:
+            async with httpx.AsyncClient(timeout=RELATED_TIMEOUT) as client:
+                resp = await client.post(
+                    f"{OPENAI_BASE_URL}/responses",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    json={
+                        "model": RELATED_MODEL,
+                        "tools": [{"type": "web_search"}],
+                        "reasoning": {"effort": "low"},
+                        "input": _RELATED_PROMPT + f"Название: {title}\n{summary[:6000]}",
+                    },
+                )
+            if resp.status_code != 200:
+                log.error("related: HTTP %s %s", resp.status_code, resp.text[:200])
+            else:
+                answer = "".join(
+                    part.get("text", "")
+                    for item in resp.json().get("output", [])
+                    if item.get("type") == "message"
+                    for part in item.get("content", [])
+                )
+                m = re.search(r"\{.*\}", answer, re.S)
+                if m:
+                    data = json.loads(m.group(0))
+                    query = str(data.get("query") or "").strip()
+                    links = data.get("links") or []
+    except Exception:
+        log.exception("related: ошибка поиска ссылок")
+
+    # Отбор: только http(s), не поисковики и не само видео, без дублей, максимум 3
+    cand, seen = [], set()
+    for item in links if isinstance(links, list) else []:
+        url = str((item or {}).get("url") or "").strip()
+        host = urlparse(url).netloc.lower()
+        if not url.startswith(("http://", "https://")) or url in seen:
+            continue
+        if any(bad in host for bad in _RELATED_BAD_HOSTS) or (own_url and url == own_url):
+            continue
+        seen.add(url)
+        cand.append((str(item.get("title") or host).strip()[:80], url))
+        if len(cand) == 3:
+            break
+    alive = await asyncio.gather(*[_url_is_alive(u) for _, u in cand])
+    cand = [c for c, ok in zip(cand, alive) if ok]
+
+    query = (query or title)[:300].strip()
+    if not query and not cand:
+        return ""
+    lines = ["🔎 Узнать больше:"]
+    if query:
+        ya, go = await asyncio.gather(
+            _shorten_url(f"https://yandex.ru/search/?text={quote_plus(query)}"),
+            _shorten_url(f"https://www.google.com/search?q={quote_plus(query)}"),
+        )
+        lines += [f"🌐 Поиск в Яндексе: {ya}", f"🌐 Поиск в Google: {go}"]
+    for t, u in cand:
+        lines.append(f"✅ {t}: {u}")
+    return "\n".join(lines)
 
 
 async def request_openai_comments_summary(video_url: str, platform: str, comments: list[dict]) -> str:
@@ -990,6 +1109,11 @@ async def summarize_video_file_and_reply(update: Update, file_id: str, file_name
         )
         log.info("videofile.summary.ok trace=%s chars=%s", trace_id, len(final_summary))
 
+        await status_msg.edit_text("🔎 Ищу ссылки по теме...")
+        related = await find_related_links(title, final_summary)
+        if related:
+            final_summary = f"{final_summary}\n\n{related}"
+
         await status_msg.delete()
 
     except SummaryError as e:
@@ -1047,6 +1171,9 @@ async def summarize_video_and_reply(update: Update, url: str):
         )
         log.info("sum.summary.ok trace=%s chars=%s", trace_id, len(final_video_summary))
 
+        # Поиск ссылок идёт параллельно с разбором комментариев
+        related_task = asyncio.create_task(find_related_links(title, final_video_summary, url))
+
         comments = await asyncio.to_thread(extract_comments, info)
         log.info("sum.comments.extract trace=%s count=%s", trace_id, len(comments))
 
@@ -1058,7 +1185,10 @@ async def summarize_video_and_reply(update: Update, url: str):
             log.error("sum.openai.comments.fail trace=%s reason=%s", trace_id, e)
             comments_block = "Комментарии: не удалось обработать комментарии для этого видео."
 
+        related = await related_task
         result = f"{final_video_summary}\n\nКомментарии:\n{comments_block}"
+        if related:
+            result += f"\n\n{related}"
     except SummaryError as e:
         log.error("sum.fail trace=%s reason=%s", trace_id, e)
         await update.message.reply_text(f"Ошибка обработки: {e}. Код: {trace_id}")

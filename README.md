@@ -7,6 +7,7 @@ A Telegram bot that summarizes YouTube and TikTok videos using AI (Grok / OpenAI
 - **YouTube & TikTok** — paste a link or use `/sum <url>`
 - **Smart transcript extraction** — prefers native subtitles; falls back to Whisper transcription for videos without them
 - **Video file support** — send an `.mp4` / `.mov` file directly to the bot
+- **Related links** — after the summary, a "🔎 Узнать больше" block: Yandex/Google search links for the video's main topic plus 1–3 real pages found via OpenAI web search (repo, product, article); dead links are dropped. Disable with `RELATED_LINKS=0`
 - **Comment analysis** — summarizes top comments alongside the video
 - **Grok + OpenAI** — uses xAI Grok as primary model, OpenAI as automatic fallback
 - **Access control** — optionally restrict to specific Telegram user IDs
